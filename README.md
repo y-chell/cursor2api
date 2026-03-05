@@ -8,6 +8,14 @@
 
 - https://github.com/7836246/cursor2api
 
+## 与上游差异（This Fork Changes）
+
+- 新增 Cloudflare Workers 入口：`src/worker.ts`（使用 Node 兼容层桥接 Express）
+- 抽离 Express 初始化：`src/app.ts`（Worker 与 Node 复用）
+- Node 本地入口改为调用 `createApp()`：`src/index.ts`
+- 新增 `wrangler.toml`：启用 `nodejs_compat` 与 Worker 入口
+- 新增 `src/cloudflare-node.d.ts`：补充 `cloudflare:node` 类型声明
+
 ## 原理
 
 ```
