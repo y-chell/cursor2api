@@ -2,6 +2,12 @@
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，可直接对接 **Claude Code**、**ChatBox**、**LobeChat** 等各类客户端。
 
+## 上游来源（Original）
+
+本项目为对上游项目的二次修改版本（非 Fork）。为便于跟踪原项目更新，请访问：
+
+- https://github.com/7836246/cursor2api
+
 ## 原理
 
 ```
