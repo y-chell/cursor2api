@@ -7,12 +7,12 @@
 import 'dotenv/config';
 import { createApp } from './app.js';
 
-const { app, config } = createApp();
+const { app, config, VERSION } = createApp();
 
 app.listen(config.port, () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════╗');
-    console.log('  ║        Cursor2API v2.0.0             ║');
+    console.log(`  ║        Cursor2API v${VERSION.padEnd(21)}║`);
     console.log('  ╠══════════════════════════════════════╣');
     console.log(`  ║  Server:  http://localhost:${config.port}      ║`);
     console.log('  ║  Model:   ' + config.cursorModel.padEnd(26) + '║');
@@ -20,11 +20,12 @@ app.listen(config.port, () => {
     console.log('  ║  API Endpoints:                      ║');
     console.log('  ║  • Anthropic: /v1/messages            ║');
     console.log('  ║  • OpenAI:   /v1/chat/completions     ║');
+    console.log('  ║  • Cursor:   /v1/responses            ║');
     console.log('  ╠══════════════════════════════════════╣');
     console.log('  ║  Claude Code:                        ║');
     console.log(`  ║  export ANTHROPIC_BASE_URL=           ║`);
     console.log(`  ║    http://localhost:${config.port}              ║`);
-    console.log('  ║  OpenAI 兼容:                        ║');
+    console.log('  ║  OpenAI / Cursor IDE:                 ║');
     console.log(`  ║  OPENAI_BASE_URL=                     ║`);
     console.log(`  ║    http://localhost:${config.port}/v1            ║`);
     console.log('  ╚══════════════════════════════════════╝');

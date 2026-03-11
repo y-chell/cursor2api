@@ -7,10 +7,21 @@ export interface AnthropicRequest {
     stream?: boolean;
     system?: string | AnthropicContentBlock[];
     tools?: AnthropicTool[];
+    tool_choice?: AnthropicToolChoice;
     temperature?: number;
     top_p?: number;
     stop_sequences?: string[];
 }
+
+/** tool_choice 控制模型是否必须调用工具
+ *  - auto: 模型自行决定（默认）
+ *  - any:  必须调用至少一个工具
+ *  - tool: 必须调用指定工具
+ */
+export type AnthropicToolChoice =
+    | { type: 'auto' }
+    | { type: 'any' }
+    | { type: 'tool'; name: string };
 
 export interface AnthropicMessage {
     role: 'user' | 'assistant';
@@ -20,6 +31,8 @@ export interface AnthropicMessage {
 export interface AnthropicContentBlock {
     type: 'text' | 'tool_use' | 'tool_result' | 'image';
     text?: string;
+    // image fields
+    source?: { type: string; media_type?: string; data: string };
     // tool_use fields
     id?: string;
     name?: string;
@@ -91,6 +104,13 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     cursorModel: string;
+    vision?: {
+        enabled: boolean;
+        mode: 'ocr' | 'api';
+        baseUrl: string;
+        apiKey: string;
+        model: string;
+    };
     fingerprint: {
         userAgent: string;
     };
