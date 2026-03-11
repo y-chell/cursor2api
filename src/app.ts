@@ -2,14 +2,21 @@
  * Express app factory for both Node and Cloudflare Workers.
  */
 
-import { createRequire } from 'module';
 import express from 'express';
 import { getConfig } from './config.js';
 import { handleMessages, listModels, countTokens } from './handler.js';
 import { handleOpenAIChatCompletions, handleOpenAIResponses } from './openai-handler.js';
 
-const require = createRequire(import.meta.url);
-const { version: VERSION } = require('../package.json') as { version: string };
+function resolveVersion() {
+    const version =
+        process.env.npm_package_version ??
+        process.env.CF_PAGES_COMMIT_SHA?.slice(0, 7) ??
+        'dev';
+
+    return version;
+}
+
+const VERSION = resolveVersion();
 
 export function createApp() {
     const app = express();

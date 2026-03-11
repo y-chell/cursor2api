@@ -16,6 +16,15 @@
 - 新增 `wrangler.toml`：启用 `nodejs_compat` 与 Worker 入口
 - 新增 `src/cloudflare-node.d.ts`：补充 `cloudflare:node` 类型声明
 
+## Cloudflare Workers 部署注意事项
+
+- `src/app.ts` 这类 Worker 与 Node 共享入口文件里，不要使用 `createRequire(import.meta.url)`、`require('../package.json')`、`__dirname`、`fs` 读取本地文件等 Node 文件系统假设来获取版本号或配置。
+- Cloudflare Worker 在部署校验阶段会实际加载入口模块；这类代码即使在本地 Node 正常，也可能在 Worker 运行时直接报错，例如：
+  `The argument 'path' must be a file URL object, a file URL string, or an absolute path string. Received 'undefined'`
+- 版本号这类信息，优先使用环境变量注入，例如 `process.env.npm_package_version`；如需构建标识，可退化为 `CF_PAGES_COMMIT_SHA` 的短 SHA。
+- `wrangler.toml` 里的 `name` 必须和 Cloudflare 上连接构建的 Worker 名称一致；否则 CI 会告警并覆盖名称，增加排查噪音。
+- 如果你后续再从上游合并 `src/app.ts`、`src/index.ts` 或构建配置，合并后先检查一遍 Cloudflare 兼容性，再推送到 GitHub。
+
 ## 原理
 
 ```
