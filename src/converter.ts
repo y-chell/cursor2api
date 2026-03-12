@@ -76,7 +76,8 @@ function buildToolInstructions(
         // ★ 使用紧凑 Schema 替代完整 JSON Schema 以大幅减小输入体积
         const schema = tool.input_schema ? compactSchema(tool.input_schema) : '{}';
         // 截断过长的工具描述（部分客户端的工具描述可达数千字符）
-        const desc = (tool.description || 'No description').substring(0, 200);
+        // ★ 80 chars 足矣：Schema 已包含参数信息，短描述减少输入体积，为输出留更多空间
+        const desc = (tool.description || 'No description').substring(0, 80);
         return `- **${tool.name}**: ${desc}\n  Params: ${schema}`;
     }).join('\n');
 
@@ -287,10 +288,25 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
         }
     }
 
-    // ★ 智能压缩已移除：
-    // 用户反馈上下文压缩会丢失旧文件的具体内容，导致模型在多轮对话中陷入死循环或幻觉（例如重复读取文件或误解历史输出）。
-    // 另外，我们已经通过 \`isTruncated\` 自动检测截断并返回 \`max_tokens\`，这也从根源上解决了需要“继续”按钮的问题。
-    // 因此这里不再主动压扁历史记录。
+    // ★ 渐进式历史压缩（替代之前全删的智能压缩）
+    // 策略：保留最近 KEEP_RECENT 条消息完整，仅压缩早期消息中的超长文本
+    // 这不会丢失消息结构（不删消息），只缩短单条消息的文本，兼顾上下文完整性和输出空间
+    const KEEP_RECENT = 6; // 保留最近6条消息不压缩
+    const EARLY_MSG_MAX_CHARS = 2000; // 早期消息的最大字符数
+    if (messages.length > KEEP_RECENT + 2) { // +2 for few-shot messages
+        const compressEnd = messages.length - KEEP_RECENT;
+        for (let i = 2; i < compressEnd; i++) { // 从 index 2 开始跳过 few-shot
+            const msg = messages[i];
+            for (const part of msg.parts) {
+                if (part.text && part.text.length > EARLY_MSG_MAX_CHARS) {
+                    const originalLen = part.text.length;
+                    part.text = part.text.substring(0, EARLY_MSG_MAX_CHARS) +
+                        `\n\n... [truncated ${originalLen - EARLY_MSG_MAX_CHARS} chars for context budget]`;
+                    console.log(`[Converter] 📦 压缩早期消息 msg[${i}] (${msg.role}): ${originalLen} → ${part.text.length} chars`);
+                }
+            }
+        }
+    }
 
     // 诊断日志：记录发给 Cursor docs AI 的消息摘要
     let totalChars = 0;
@@ -311,7 +327,8 @@ export async function convertToCursorRequest(req: AnthropicRequest): Promise<Cur
 }
 
 // 最大工具结果长度（超过则截断，防止上下文溢出）
-const MAX_TOOL_RESULT_LENGTH = 30000;
+// ★ 15000 chars 平衡点：保留足够信息让模型理解结果，同时为输出留空间
+const MAX_TOOL_RESULT_LENGTH = 15000;
 
 
 
@@ -456,42 +473,45 @@ function tolerantParse(jsonStr: string): any {
 
     // 第二次尝试：处理字符串内的裸换行符、制表符
     let inString = false;
-    let escaped = false;
     let fixed = '';
     const bracketStack: string[] = []; // 跟踪 { 和 [ 的嵌套层级
 
     for (let i = 0; i < jsonStr.length; i++) {
         const char = jsonStr[i];
 
-        if (char === '\\' && !escaped) {
-            escaped = true;
+        // ★ 精确反斜杠计数：只有奇数个连续反斜杠后的引号才是转义的
+        if (char === '"') {
+            let backslashCount = 0;
+            for (let j = i - 1; j >= 0 && fixed[j] === '\\'; j--) {
+                backslashCount++;
+            }
+            if (backslashCount % 2 === 0) {
+                // 偶数个反斜杠 → 引号未被转义 → 切换字符串状态
+                inString = !inString;
+            }
             fixed += char;
-        } else if (char === '"' && !escaped) {
-            inString = !inString;
-            fixed += char;
-            escaped = false;
-        } else {
-            if (inString) {
-                // 裸控制字符转义
-                if (char === '\n') {
-                    fixed += '\\n';
-                } else if (char === '\r') {
-                    fixed += '\\r';
-                } else if (char === '\t') {
-                    fixed += '\\t';
-                } else {
-                    fixed += char;
-                }
+            continue;
+        }
+
+        if (inString) {
+            // 裸控制字符转义
+            if (char === '\n') {
+                fixed += '\\n';
+            } else if (char === '\r') {
+                fixed += '\\r';
+            } else if (char === '\t') {
+                fixed += '\\t';
             } else {
-                // 在字符串外跟踪括号层级
-                if (char === '{' || char === '[') {
-                    bracketStack.push(char === '{' ? '}' : ']');
-                } else if (char === '}' || char === ']') {
-                    if (bracketStack.length > 0) bracketStack.pop();
-                }
                 fixed += char;
             }
-            escaped = false;
+        } else {
+            // 在字符串外跟踪括号层级
+            if (char === '{' || char === '[') {
+                bracketStack.push(char === '{' ? '}' : ']');
+            } else if (char === '}' || char === ']') {
+                if (bracketStack.length > 0) bracketStack.pop();
+            }
+            fixed += char;
         }
     }
 
@@ -530,20 +550,21 @@ function tolerantParse(jsonStr: string): any {
                 let params: Record<string, unknown> = {};
                 if (paramsMatch) {
                     const paramsStr = paramsMatch[1];
-                    // 逐字符找到 parameters 对象的闭合 }
+                    // 逐字符找到 parameters 对象的闭合 }，使用精确反斜杠计数
                     let depth = 0;
                     let end = -1;
                     let pInString = false;
-                    let pEscaped = false;
                     for (let i = 0; i < paramsStr.length; i++) {
                         const c = paramsStr[i];
-                        if (c === '\\' && !pEscaped) { pEscaped = true; continue; }
-                        if (c === '"' && !pEscaped) { pInString = !pInString; }
+                        if (c === '"') {
+                            let bsc = 0;
+                            for (let j = i - 1; j >= 0 && paramsStr[j] === '\\'; j--) bsc++;
+                            if (bsc % 2 === 0) pInString = !pInString;
+                        }
                         if (!pInString) {
                             if (c === '{') depth++;
                             if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
                         }
-                        pEscaped = false;
                     }
                     if (end > 0) {
                         const rawParams = paramsStr.substring(0, end + 1);
@@ -561,6 +582,67 @@ function tolerantParse(jsonStr: string): any {
                 }
                 console.log(`[Converter] tolerantParse 正则兜底成功: tool=${toolName}, params=${Object.keys(params).length} fields`);
                 return { tool: toolName, parameters: params };
+            }
+        } catch { /* ignore */ }
+
+        // ★ 第五次尝试：逆向贪婪提取大值字段
+        // 专门处理 Write/Edit 工具的 content 参数包含未转义引号导致 JSON 完全损坏的情况
+        // 策略：先找到 tool 名，然后对 content/command/text 等大值字段，
+        // 取该字段 "key": " 后面到最后一个可能的闭合点之间的所有内容
+        try {
+            const toolMatch2 = jsonStr.match(/["'](?:tool|name)["']\s*:\s*["']([^"']+)["']/);
+            if (toolMatch2) {
+                const toolName = toolMatch2[1];
+                const params: Record<string, unknown> = {};
+
+                // 大值字段列表（这些字段最容易包含有问题的内容）
+                const bigValueFields = ['content', 'command', 'text', 'new_string', 'new_str', 'file_text', 'code'];
+                // 小值字段仍用正则精确提取
+                const smallFieldRegex = /"(file_path|path|file|old_string|old_str|insert_line|mode|encoding|description|language|name)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+                let sfm;
+                while ((sfm = smallFieldRegex.exec(jsonStr)) !== null) {
+                    params[sfm[1]] = sfm[2].replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+                }
+
+                // 对大值字段进行贪婪提取：从 "content": " 开始，到倒数第二个 " 结束
+                for (const field of bigValueFields) {
+                    const fieldStart = jsonStr.indexOf(`"${field}"`);
+                    if (fieldStart === -1) continue;
+
+                    // 找到 ": " 后的第一个引号
+                    const colonPos = jsonStr.indexOf(':', fieldStart + field.length + 2);
+                    if (colonPos === -1) continue;
+                    const valueStart = jsonStr.indexOf('"', colonPos);
+                    if (valueStart === -1) continue;
+
+                    // 从末尾逆向查找：跳过可能的 }]} 和空白，找到值的结束引号
+                    let valueEnd = jsonStr.length - 1;
+                    // 跳过尾部的 }, ], 空白
+                    while (valueEnd > valueStart && /[}\]\s,]/.test(jsonStr[valueEnd])) {
+                        valueEnd--;
+                    }
+                    // 此时 valueEnd 应该指向值的结束引号
+                    if (jsonStr[valueEnd] === '"' && valueEnd > valueStart + 1) {
+                        const rawValue = jsonStr.substring(valueStart + 1, valueEnd);
+                        // 尝试解码 JSON 转义序列
+                        try {
+                            params[field] = JSON.parse(`"${rawValue}"`);
+                        } catch {
+                            // 如果解码失败，做基本替换
+                            params[field] = rawValue
+                                .replace(/\\n/g, '\n')
+                                .replace(/\\t/g, '\t')
+                                .replace(/\\r/g, '\r')
+                                .replace(/\\\\/g, '\\')
+                                .replace(/\\"/g, '"');
+                        }
+                    }
+                }
+
+                if (Object.keys(params).length > 0) {
+                    console.log(`[Converter] tolerantParse 逆向贪婪提取成功: tool=${toolName}, fields=[${Object.keys(params).join(', ')}]`);
+                    return { tool: toolName, parameters: params };
+                }
             }
         } catch { /* ignore */ }
 
@@ -595,26 +677,23 @@ export function parseToolCalls(responseText: string): {
         // 从内容起始处向前扫描，跳过 JSON 字符串内部的 ```
         let pos = contentStart;
         let inJsonString = false;
-        let escaped = false;
         let closingPos = -1;
 
         while (pos < responseText.length - 2) {
             const char = responseText[pos];
 
-            if (escaped) {
-                escaped = false;
-                pos++;
-                continue;
-            }
-
-            if (char === '\\' && inJsonString) {
-                escaped = true;
-                pos++;
-                continue;
-            }
-
             if (char === '"') {
-                inJsonString = !inJsonString;
+                // ★ 精确反斜杠计数：计算引号前连续反斜杠的数量
+                // 只有奇数个反斜杠时引号才是被转义的
+                // 例如: \" → 转义(1个\), \\" → 未转义(2个\), \\\" → 转义(3个\)
+                let backslashCount = 0;
+                for (let j = pos - 1; j >= contentStart && responseText[j] === '\\'; j--) {
+                    backslashCount++;
+                }
+                if (backslashCount % 2 === 0) {
+                    // 偶数个反斜杠 → 引号未被转义 → 切换字符串状态
+                    inJsonString = !inJsonString;
+                }
                 pos++;
                 continue;
             }
@@ -640,7 +719,13 @@ export function parseToolCalls(responseText: string): {
                     blocksToRemove.push({ start: blockStart, end: closingPos + 3 });
                 }
             } catch (e) {
-                console.error('[Converter] tolerantParse 失败:', e);
+                // 仅当内容看起来像工具调用时才报 error，否则可能只是普通 JSON 代码块（代码示例等）
+                const looksLikeToolCall = /["'](?:tool|name)["']\s*:/.test(jsonContent);
+                if (looksLikeToolCall) {
+                    console.error('[Converter] tolerantParse 失败（疑似工具调用）:', e);
+                } else {
+                    console.warn(`[Converter] 跳过非工具调用的 json 代码块 (${jsonContent.length} chars)`);
+                }
             }
         } else {
             // 没有闭合 ``` — 代码块被截断，尝试解析已有内容
