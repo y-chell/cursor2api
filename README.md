@@ -336,3 +336,71 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 ## License
 
 [MIT](LICENSE)
+
+## 2026-03-12 服务器 Docker 独立部署说明
+
+这个项目当前同时保留了两条运行路线：
+
+- Cloudflare Workers 路线：使用 `src/worker.ts`
+- 普通服务器 Node/Docker 路线：使用 `src/index.ts`
+
+两者不冲突。当前仓库中的 `Dockerfile` 和 `docker-compose.yml` 走的是普通服务器 Node 版本，不会启动 Worker 入口。
+
+### 推荐部署方式
+
+不要并入现有 `ai-stack-staging`。
+
+建议在服务器上为它新建独立容器编排，例如：
+
+- 编排名：`cursor2api-stack`
+- 目录：`/www/server/panel/data/compose/cursor2api-stack`
+
+### 推荐服务器目录内容
+
+把以下文件放到同一目录：
+
+- `docker-compose.yml`
+- `Dockerfile`
+- `package.json`
+- `package-lock.json`
+- `tsconfig.json`
+- `src/`
+- `config.yaml`
+
+### 启动方式
+
+在服务器项目目录执行：
+
+```bash
+cd /www/server/panel/data/compose/cursor2api-stack
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cursor2api
+```
+
+### 当前默认端口
+
+- 容器内端口：`3010`
+- 宿主机映射端口：`3010`
+
+### 反向代理建议
+
+不要直接暴露端口给公网，建议像 `newapi` / `cpa` 一样走域名反代。
+
+例如：
+
+- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+
+### 部署前检查项
+
+1. `config.yaml` 中的 `cursor_model` 是否符合当前实际需求
+2. 如果服务器需要代理，确认 `config.yaml` 或环境变量 `PROXY` 已配置
+3. 如果只是做服务器版备用实例，域名不要与 Cloudflare Workers 线上入口复用
+
+### 说明
+
+当前 `docker-compose.yml` 中保留了：
+
+- `init: true`
+
+这是为了容器内进程管理更稳，不影响 Cloudflare Workers 路线。

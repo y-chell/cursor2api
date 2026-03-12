@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
     image: cursor2api:latest
     container_name: cursor2api
+    init: true
     restart: unless-stopped
     ports:
       - "3010:3010"
