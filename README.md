@@ -372,40 +372,8 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 
 ### 推荐部署方式
 
-不要并入现有 `ai-stack-staging`。
+建议将它作为独立服务部署，使用单独的目录和单独的容器编排。
 
-建议在服务器上为它新建独立容器编排，例如：
-
-- 编排名：`cursor2api-stack`
-- 目录：`/www/server/panel/data/compose/cursor2api-stack`
-
-### 推荐服务器目录内容
-
-把以下文件放到同一目录：
-
-- `docker-compose.yml`
-- `Dockerfile`
-- `package.json`
-- `package-lock.json`
-- `tsconfig.json`
-- `src/`
-- `config.yaml`
-
-### 启动方式
-
-在服务器项目目录执行：
-
-```bash
-cd /www/server/panel/data/compose/cursor2api-stack
-docker compose up -d --build
-docker compose ps
-docker compose logs --tail=100 cursor2api
-```
-
-### 当前默认端口
-
-- 容器内端口：`3010`
-- 宿主机映射端口：`3010`
 
 ### 反向代理建议
 
@@ -428,3 +396,47 @@ docker compose logs --tail=100 cursor2api
 - `init: true`
 
 这是为了容器内进程管理更稳，不影响 Cloudflare Workers 路线。
+
+## 2026-03-12 服务器终端直接部署命令
+
+如果你不想走 aaPanel 的编排编辑器，可以直接在服务器终端部署。
+
+### 1. 首次部署
+
+```bash
+git clone https://github.com/y-chell/cursor2api.git cursor2api-stack
+cd cursor2api-stack
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cursor2api
+```
+
+### 2. 后续更新
+
+```bash
+cd /path/to/cursor2api-stack
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cursor2api
+```
+
+### 3. 反向代理目标
+
+服务启动成功后，反代到：
+
+- `http://127.0.0.1:3010`
+
+例如：
+
+- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+
+### 4. 部署后检查
+
+至少确认以下几点：
+
+1. `docker compose ps` 中 `cursor2api` 为 `Up`
+2. 日志里没有启动时报错
+3. 本机访问 `http://127.0.0.1:3010/health` 能返回状态
