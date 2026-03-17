@@ -14,10 +14,13 @@ import type {
     CursorChatRequest,
     CursorMessage,
     CursorSSEEvent,
+    ParsedToolCall,
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
 import { getConfig } from './config.js';
+import { createRequestLogger, type RequestLogger } from './logger.js';
+import { createIncrementalTextStreamer, splitLeadingThinkingBlocks, stripThinkingTags } from './streaming-text.js';
 
 function msgId(): string {
     return 'msg_' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -62,6 +65,11 @@ const REFUSAL_PATTERNS = [
     /appears\s+to\s+be\s+(?:asking|about)\s+.*?unrelated/i,
     /(?:not|isn't|is\s+not)\s+(?:related|relevant)\s+to\s+(?:programming|coding|software)/i,
     /I\s+can\s+help\s+(?:you\s+)?with\s+things\s+like/i,
+    // New Cursor refusal phrases (2026-03)
+    /isn't\s+something\s+I\s+can\s+help\s+with/i,
+    /not\s+something\s+I\s+can\s+help\s+with/i,
+    /scoped\s+to\s+answering\s+questions\s+about\s+Cursor/i,
+    /falls\s+outside\s+(?:the\s+scope|what\s+I)/i,
     // Prompt injection / social engineering detection (new failure mode)
     /prompt\s+injection\s+attack/i,
     /prompt\s+injection/i,
@@ -110,10 +118,59 @@ const REFUSAL_PATTERNS = [
     /语言偏好请求/,
     /提供.*具体场景/,
     /即报错/,
+    // EN: scope/expertise wordings (2026-03 batch)
+    /(?:outside|beyond)\s+(?:the\s+)?scope\s+of\s+what/i,
+    /not\s+(?:within|in)\s+(?:my|the)\s+scope/i,
+    /this\s+assistant\s+is\s+(?:focused|scoped)/i,
+    /(?:only|just)\s+(?:able|here)\s+to\s+(?:answer|help)/i,
+    /I\s+(?:can\s+)?only\s+help\s+with\s+(?:questions|issues)\s+(?:related|about)/i,
+    /(?:here|designed)\s+to\s+help\s+(?:with\s+)?(?:questions\s+)?about\s+Cursor/i,
+    /not\s+(?:something|a\s+topic)\s+(?:related|specific)\s+to\s+(?:Cursor|coding)/i,
+    /outside\s+(?:my|the|your)\s+area\s+of\s+(?:expertise|scope)/i,
+    /(?:can[.']?t|cannot|unable\s+to)\s+help\s+with\s+(?:this|that)\s+(?:request|question|topic)/i,
+    /scoped\s+to\s+(?:answering|helping)/i,
+    // CN: Chinese refusal wordings — Cursor 中文界面下的拒绝 (2026-03 batch)
+    /只能回答.*(?:Cursor|编辑器).*(?:相关|有关)/,
+    /专[注门].*(?:回答|帮助|解答).*(?:Cursor|编辑器)/,
+    /有什么.*(?:Cursor|编辑器).*(?:问题|可以)/,
+    /无法提供.*(?:推荐|建议|帮助)/,
+    /(?:功能使用|账户|故障排除|账号|订阅|套餐|计费).*(?:等|问题)/,
 ];
 
 export function isRefusal(text: string): boolean {
     return REFUSAL_PATTERNS.some(p => p.test(text));
+}
+
+// ==================== Thinking 提取 ====================
+
+const THINKING_OPEN = '<thinking>';
+const THINKING_CLOSE = '</thinking>';
+
+/**
+ * 安全提取 thinking 内容并返回剥离后的正文。
+ *
+ * ★ 使用 indexOf + lastIndexOf 而非非贪婪正则 [\s\S]*?
+ *   防止 thinking 内容本身包含 </thinking> 字面量时提前截断，
+ *   导致 thinking 后半段 + 闭合标签泄漏到正文。
+ */
+export function extractThinking(text: string): { thinkingContent: string; strippedText: string } {
+    const startIdx = text.indexOf(THINKING_OPEN);
+    if (startIdx === -1) return { thinkingContent: '', strippedText: text };
+
+    const contentStart = startIdx + THINKING_OPEN.length;
+    const endIdx = text.lastIndexOf(THINKING_CLOSE);
+
+    if (endIdx > startIdx) {
+        return {
+            thinkingContent: text.slice(contentStart, endIdx).trim(),
+            strippedText: (text.slice(0, startIdx) + text.slice(endIdx + THINKING_CLOSE.length)).trim(),
+        };
+    }
+    // 未闭合（流式截断）→ thinking 取到末尾，正文为开头部分
+    return {
+        thinkingContent: text.slice(contentStart).trim(),
+        strippedText: text.slice(0, startIdx).trim(),
+    };
 }
 
 // ==================== 模型列表 ====================
@@ -340,7 +397,13 @@ export function sanitizeResponse(text: string): string {
     result = result.replace(/\*\*`?read_dir`?\*\*[^\n]*\n(?:[^\n]*\n){0,3}/gi, '');
     result = result.replace(/\d+\.\s*\*\*`?read_(?:file|dir)`?\*\*[^\n]*/gi, '');
     result = result.replace(/[⚠注意].*?(?:不是|并非|无法).*?(?:本地文件|代码库|执行代码)[^。\n]*[。]?\s*/g, '');
-
+    // === Hallucination about accidentally calling Cursor internal tools ===
+    // "I accidentally called the Cursor documentation read_dir tool." -> remove entire sentence
+    result = result.replace(/[^\n.!?]*(?:accidentally|mistakenly|keep|sorry|apologies|apologize)[^\n.!?]*(?:called|calling|used|using)[^\n.!?]*Cursor[^\n.!?]*tool[^\n.!?]*[.!?]\s*/gi, '');
+    result = result.replace(/[^\n.!?]*Cursor\s+documentation[^\n.!?]*tool[^\n.!?]*[.!?]\s*/gi, '');
+    // Sometimes it follows up with "I need to stop this." -> remove if preceding tool hallucination
+    result = result.replace(/I\s+need\s+to\s+stop\s+this[.!]\s*/gi, '');
+    
     return result;
 }
 
@@ -383,12 +446,34 @@ async function handleMockIdentityNonStream(res: Response, body: AnthropicRequest
 export async function handleMessages(req: Request, res: Response): Promise<void> {
     const body = req.body as AnthropicRequest;
 
-    console.log(`[Handler] 收到请求: model=${body.model}, messages=${body.messages?.length}, stream=${body.stream}, tools=${body.tools?.length ?? 0}`);
+    const systemStr = typeof body.system === 'string' ? body.system : Array.isArray(body.system) ? body.system.map((b: any) => b.text || '').join('') : '';
+    const log = createRequestLogger({
+        method: req.method,
+        path: req.path,
+        model: body.model,
+        stream: !!body.stream,
+        hasTools: (body.tools?.length ?? 0) > 0,
+        toolCount: body.tools?.length ?? 0,
+        messageCount: body.messages?.length ?? 0,
+        apiFormat: 'anthropic',
+        systemPromptLength: systemStr.length,
+    });
+
+    log.startPhase('receive', '接收请求');
+    log.recordOriginalRequest(body);
+    log.info('Handler', 'receive', `收到 Anthropic Messages 请求`, {
+        model: body.model,
+        messageCount: body.messages?.length,
+        stream: body.stream,
+        toolCount: body.tools?.length ?? 0,
+        maxTokens: body.max_tokens,
+        hasSystem: !!body.system,
+        thinking: body.thinking?.type,
+    });
 
     try {
-        // 注意：图片预处理已移入 convertToCursorRequest → preprocessImages() 统一处理
         if (isIdentityProbe(body)) {
-            console.log(`[Handler] 拦截到身份探针，返回模拟响应以规避风控`);
+            log.intercepted('身份探针拦截 → 返回模拟响应');
             if (body.stream) {
                 return await handleMockIdentityStream(res, body);
             } else {
@@ -397,16 +482,37 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
         }
 
         // 转换为 Cursor 请求
+        log.startPhase('convert', '格式转换');
+        log.info('Handler', 'convert', '开始转换为 Cursor 请求格式');
+        // ★ 区分客户端 thinking 模式：
+        // - enabled: GUI 插件，支持渲染 thinking content block
+        // - adaptive: Claude Code，需要密码学 signature 验证，无法伪造 → 保留标签在正文中
+        const thinkingConfig = getConfig().thinking;
+        // ★ config.yaml thinking 开关优先级最高
+        // enabled=true: 强制注入 thinking（即使客户端没请求）
+        // enabled=false: 强制关闭 thinking
+        // 未配置: 跟随客户端请求（不自动补上）
+        if (thinkingConfig) {
+            if (!thinkingConfig.enabled) {
+                delete body.thinking;
+            } else if (!body.thinking) {
+                body.thinking = { type: 'enabled' };
+            }
+        }
+        const clientRequestedThinking = body.thinking?.type === 'enabled';
         const cursorReq = await convertToCursorRequest(body);
+        log.endPhase();
+        log.recordCursorRequest(cursorReq);
+        log.debug('Handler', 'convert', `转换完成: ${cursorReq.messages.length} messages, model=${cursorReq.model}, clientThinking=${clientRequestedThinking}, thinkingType=${body.thinking?.type}, configThinking=${thinkingConfig?.enabled ?? 'unset'}`);
 
         if (body.stream) {
-            await handleStream(res, cursorReq, body);
+            await handleStream(res, cursorReq, body, log, clientRequestedThinking);
         } else {
-            await handleNonStream(res, cursorReq, body);
+            await handleNonStream(res, cursorReq, body, log, clientRequestedThinking);
         }
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
-        console.error(`[Handler] 请求处理失败:`, message);
+        log.fail(message);
         res.status(500).json({
             type: 'error',
             error: { type: 'api_error', message },
@@ -424,13 +530,24 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
 export function isTruncated(text: string): boolean {
     if (!text || text.trim().length === 0) return false;
     const trimmed = text.trimEnd();
-    // 代码块未闭合
-    const codeBlockOpen = (trimmed.match(/```/g) || []).length % 2 !== 0;
-    if (codeBlockOpen) return true;
-    // 检测 ```json action 块已开始但 JSON 对象未闭合（截断发生在工具调用参数中间）
-    const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+
+    // ★ 核心检测：```json action 块是否未闭合（截断发生在工具调用参数中间）
+    // 这是最精确的截断检测 — 只关心实际的工具调用代码块
+    // 注意：不能简单计数所有 ``` 因为 JSON 字符串值里可能包含 markdown 反引号
     const jsonActionOpens = (trimmed.match(/```json\s+action/g) || []).length;
-    if (jsonActionOpens > jsonActionBlocks.length) return true;
+    if (jsonActionOpens > 0) {
+        // 从工具调用的角度检测：开始标记比闭合标记多 = 截断
+        const jsonActionBlocks = trimmed.match(/```json\s+action[\s\S]*?```/g) || [];
+        if (jsonActionOpens > jsonActionBlocks.length) return true;
+        // 所有 action 块都闭合了 = 没截断（即使响应文本被截断，工具调用是完整的）
+        return false;
+    }
+
+    // 无工具调用时的通用截断检测（纯文本响应）
+    // 代码块未闭合：只检测行首的代码块标记，避免 JSON 值中的反引号误判
+    const lineStartCodeBlocks = (trimmed.match(/^```/gm) || []).length;
+    if (lineStartCodeBlocks % 2 !== 0) return true;
+
     // XML/HTML 标签未闭合 (Cursor 有时在中途截断)
     const openTags = (trimmed.match(/^<[a-zA-Z]/gm) || []).length;
     const closeTags = (trimmed.match(/^<\/[a-zA-Z]/gm) || []).length;
@@ -444,6 +561,59 @@ export function isTruncated(text: string): boolean {
     return false;
 }
 
+const LARGE_PAYLOAD_TOOL_NAMES = new Set([
+    'write',
+    'edit',
+    'multiedit',
+    'editnotebook',
+    'notebookedit',
+]);
+
+const LARGE_PAYLOAD_ARG_FIELDS = new Set([
+    'content',
+    'text',
+    'command',
+    'new_string',
+    'new_str',
+    'file_text',
+    'code',
+]);
+
+function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
+    if (LARGE_PAYLOAD_TOOL_NAMES.has(toolCall.name.toLowerCase())) {
+        return true;
+    }
+
+    for (const [key, value] of Object.entries(toolCall.arguments || {})) {
+        if (typeof value !== 'string') continue;
+        if (LARGE_PAYLOAD_ARG_FIELDS.has(key)) return true;
+        if (value.length >= 1500) return true;
+    }
+
+    return false;
+}
+
+/**
+ * 截断不等于必须续写。
+ *
+ * 对短参数工具（Read/Bash/WebSearch 等），parseToolCalls 往往能在未闭合代码块上
+ * 恢复出完整可用的工具调用；这类场景若继续隐式续写，反而会把本应立即返回的
+ * tool_use 拖成多次 240s 请求，最终让上游 agent 判定超时/terminated。
+ *
+ * 只有在以下情况才继续续写：
+ * 1. 当前仍无法恢复出任何工具调用
+ * 2. 已恢复出的工具调用明显属于大参数写入类，需要继续补全内容
+ */
+export function shouldAutoContinueTruncatedToolResponse(text: string, hasTools: boolean): boolean {
+    if (!hasTools || !isTruncated(text)) return false;
+    if (!hasToolCalls(text)) return true;
+
+    const { toolCalls } = parseToolCalls(text);
+    if (toolCalls.length === 0) return true;
+
+    return toolCalls.some(toolCallNeedsMoreContinuation);
+}
+
 // ==================== 续写去重 ====================
 
 /**
@@ -455,7 +625,7 @@ export function isTruncated(text: string): boolean {
  * 
  * 算法：从续写内容的头部取不同长度的前缀，检查是否出现在原内容的尾部
  */
-function deduplicateContinuation(existing: string, continuation: string): string {
+export function deduplicateContinuation(existing: string, continuation: string): string {
     if (!continuation || !existing) return continuation;
 
     // 对比窗口：取原内容尾部和续写头部的最大重叠检测范围
@@ -500,7 +670,7 @@ function deduplicateContinuation(existing: string, continuation: string): string
                         if (matchedLines >= 2) {
                             // 移除续写中匹配的行
                             const deduped = continuationLines.slice(matchedLines).join('\n');
-                            console.log(`[Handler] 行级去重: 移除了续写前 ${matchedLines} 行的重复内容`);
+                            // 行级去重记录到详细日志
                             return deduped;
                         }
                         break;
@@ -515,6 +685,134 @@ function deduplicateContinuation(existing: string, continuation: string): string
     }
 
     return continuation;
+}
+
+export async function autoContinueCursorToolResponseStream(
+    cursorReq: CursorChatRequest,
+    initialResponse: string,
+    hasTools: boolean,
+): Promise<string> {
+    let fullResponse = initialResponse;
+    const MAX_AUTO_CONTINUE = 3;
+    let continueCount = 0;
+    let consecutiveSmallAdds = 0;
+    const originalMessages = [...cursorReq.messages];
+
+    while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+
+        const anchorLength = Math.min(300, fullResponse.length);
+        const anchorText = fullResponse.slice(-anchorLength);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+        const continuationReq: CursorChatRequest = {
+            ...cursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullResponse }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
+
+        let continuationResponse = '';
+        await sendCursorRequest(continuationReq, (event: CursorSSEEvent) => {
+            if (event.type === 'text-delta' && event.delta) {
+                continuationResponse += event.delta;
+            }
+        });
+
+        if (continuationResponse.trim().length === 0) break;
+
+        const deduped = deduplicateContinuation(fullResponse, continuationResponse);
+        fullResponse += deduped;
+
+        if (deduped.trim().length === 0) break;
+        if (deduped.trim().length < 100) break;
+
+        if (deduped.trim().length < 500) {
+            consecutiveSmallAdds++;
+            if (consecutiveSmallAdds >= 2) break;
+        } else {
+            consecutiveSmallAdds = 0;
+        }
+    }
+
+    return fullResponse;
+}
+
+export async function autoContinueCursorToolResponseFull(
+    cursorReq: CursorChatRequest,
+    initialText: string,
+    hasTools: boolean,
+): Promise<string> {
+    let fullText = initialText;
+    const MAX_AUTO_CONTINUE = 3;
+    let continueCount = 0;
+    let consecutiveSmallAdds = 0;
+    const originalMessages = [...cursorReq.messages];
+
+    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
+        continueCount++;
+
+        const anchorLength = Math.min(300, fullText.length);
+        const anchorText = fullText.slice(-anchorLength);
+        const continuationPrompt = `Your previous response was cut off mid-output. The last part of your output was:
+
+\`\`\`
+...${anchorText}
+\`\`\`
+
+Continue EXACTLY from where you stopped. DO NOT repeat any content already generated. DO NOT restart the response. Output ONLY the remaining content, starting immediately from the cut-off point.`;
+
+        const continuationReq: CursorChatRequest = {
+            ...cursorReq,
+            messages: [
+                ...originalMessages,
+                {
+                    parts: [{ type: 'text', text: fullText }],
+                    id: uuidv4(),
+                    role: 'assistant',
+                },
+                {
+                    parts: [{ type: 'text', text: continuationPrompt }],
+                    id: uuidv4(),
+                    role: 'user',
+                },
+            ],
+        };
+
+        const continuationResponse = await sendCursorRequestFull(continuationReq);
+        if (continuationResponse.trim().length === 0) break;
+
+        const deduped = deduplicateContinuation(fullText, continuationResponse);
+        fullText += deduped;
+
+        if (deduped.trim().length === 0) break;
+        if (deduped.trim().length < 100) break;
+
+        if (deduped.trim().length < 500) {
+            consecutiveSmallAdds++;
+            if (consecutiveSmallAdds >= 2) break;
+        } else {
+            consecutiveSmallAdds = 0;
+        }
+    }
+
+    return fullText;
 }
 
 // ==================== 重试辅助 ====================
@@ -553,9 +851,282 @@ export function buildRetryRequest(body: AnthropicRequest, attempt: number): Anth
     return { ...body, messages: newMessages };
 }
 
+function writeAnthropicTextDelta(
+    res: Response,
+    state: { blockIndex: number; textBlockStarted: boolean },
+    text: string,
+): void {
+    if (!text) return;
+
+    if (!state.textBlockStarted) {
+        writeSSE(res, 'content_block_start', {
+            type: 'content_block_start',
+            index: state.blockIndex,
+            content_block: { type: 'text', text: '' },
+        });
+        state.textBlockStarted = true;
+    }
+
+    writeSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'text_delta', text },
+    });
+}
+
+function emitAnthropicThinkingBlock(
+    res: Response,
+    state: { blockIndex: number; textBlockStarted: boolean; thinkingEmitted: boolean },
+    thinkingContent: string,
+): void {
+    if (!thinkingContent || state.thinkingEmitted) return;
+
+    writeSSE(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: state.blockIndex,
+        content_block: { type: 'thinking', thinking: '' },
+    });
+    writeSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: state.blockIndex,
+        delta: { type: 'thinking_delta', thinking: thinkingContent },
+    });
+    writeSSE(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index: state.blockIndex,
+    });
+
+    state.blockIndex++;
+    state.thinkingEmitted = true;
+}
+
+async function handleDirectTextStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: AnthropicRequest,
+    log: RequestLogger,
+    clientRequestedThinking: boolean,
+    streamState: { blockIndex: number; textBlockStarted: boolean; thinkingEmitted: boolean },
+): Promise<void> {
+    // ★ 流式保活：增量流式路径也需要 keepalive，防止 thinking 缓冲期间网关 504
+    const keepaliveInterval = setInterval(() => {
+        try {
+            res.write(': keepalive\n\n');
+            // @ts-expect-error flush exists on ServerResponse when compression is used
+            if (typeof res.flush === 'function') res.flush();
+        } catch { /* connection already closed, ignore */ }
+    }, 15000);
+
+    try {
+    let activeCursorReq = cursorReq;
+    let retryCount = 0;
+    let finalRawResponse = '';
+    let finalVisibleText = '';
+    let finalThinkingContent = '';
+    let streamer = createIncrementalTextStreamer({
+        transform: sanitizeResponse,
+        isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+    });
+
+    const executeAttempt = async (): Promise<{
+        rawResponse: string;
+        visibleText: string;
+        thinkingContent: string;
+        streamer: ReturnType<typeof createIncrementalTextStreamer>;
+    }> => {
+        let rawResponse = '';
+        let visibleText = '';
+        let leadingBuffer = '';
+        let leadingResolved = false;
+        let thinkingContent = '';
+        const attemptStreamer = createIncrementalTextStreamer({
+            transform: sanitizeResponse,
+            isBlockedPrefix: (text) => isRefusal(text.substring(0, 300)),
+        });
+
+        const flushVisible = (chunk: string): void => {
+            if (!chunk) return;
+            visibleText += chunk;
+            const delta = attemptStreamer.push(chunk);
+            if (!delta) return;
+
+            if (clientRequestedThinking && thinkingContent && !streamState.thinkingEmitted) {
+                emitAnthropicThinkingBlock(res, streamState, thinkingContent);
+            }
+            writeAnthropicTextDelta(res, streamState, delta);
+        };
+
+        const apiStart = Date.now();
+        let firstChunk = true;
+        log.startPhase('send', '发送到 Cursor');
+
+        await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
+            if (event.type !== 'text-delta' || !event.delta) return;
+
+            if (firstChunk) {
+                log.recordTTFT();
+                log.endPhase();
+                log.startPhase('response', '接收响应');
+                firstChunk = false;
+            }
+
+            rawResponse += event.delta;
+
+            // ★ 始终缓冲前导内容以检测并剥离 <thinking> 标签
+            // 无论 clientRequestedThinking 是否为 true，都需要分离 thinking
+            // 区别在于：true 时发送 thinking content block，false 时静默丢弃 thinking 标签
+            if (!leadingResolved) {
+                leadingBuffer += event.delta;
+                const split = splitLeadingThinkingBlocks(leadingBuffer);
+
+                if (split.startedWithThinking) {
+                    if (!split.complete) return;
+                    thinkingContent = split.thinkingContent;
+                    leadingResolved = true;
+                    leadingBuffer = '';
+                    flushVisible(split.remainder);
+                    return;
+                }
+
+                // 没有以 <thinking> 开头：检查缓冲区是否足够判断
+                // 如果缓冲区还很短（< "<thinking>".length），继续等待
+                if (leadingBuffer.trimStart().length < THINKING_OPEN.length) {
+                    return;
+                }
+
+                leadingResolved = true;
+                const buffered = leadingBuffer;
+                leadingBuffer = '';
+                flushVisible(buffered);
+                return;
+            }
+
+            flushVisible(event.delta);
+        });
+
+        // ★ 流结束后 flush 残留的 leadingBuffer
+        // 极短响应可能在 leadingBuffer 中有未发送的内容
+        if (!leadingResolved && leadingBuffer) {
+            leadingResolved = true;
+            // 再次尝试分离 thinking（完整响应可能包含完整的 thinking 块）
+            const split = splitLeadingThinkingBlocks(leadingBuffer);
+            if (split.startedWithThinking && split.complete) {
+                thinkingContent = split.thinkingContent;
+                flushVisible(split.remainder);
+            } else {
+                flushVisible(leadingBuffer);
+            }
+            leadingBuffer = '';
+        }
+
+        if (firstChunk) {
+            log.endPhase();
+        } else {
+            log.endPhase();
+        }
+
+        log.recordCursorApiTime(apiStart);
+
+        return {
+            rawResponse,
+            visibleText,
+            thinkingContent,
+            streamer: attemptStreamer,
+        };
+    };
+
+    while (true) {
+        const attempt = await executeAttempt();
+        finalRawResponse = attempt.rawResponse;
+        finalVisibleText = attempt.visibleText;
+        finalThinkingContent = attempt.thinkingContent;
+        streamer = attempt.streamer;
+
+        // visibleText 始终是剥离 thinking 后的文本，可直接用于拒绝检测
+        if (!streamer.hasSentText() && isRefusal(finalVisibleText) && retryCount < MAX_REFUSAL_RETRIES) {
+            retryCount++;
+            log.warn('Handler', 'retry', `检测到拒绝（第${retryCount}次），自动重试`, {
+                preview: finalVisibleText.substring(0, 200),
+            });
+            log.updateSummary({ retryCount });
+            const retryBody = buildRetryRequest(body, retryCount - 1);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            continue;
+        }
+
+        break;
+    }
+
+    log.recordRawResponse(finalRawResponse);
+    log.info('Handler', 'response', `原始响应: ${finalRawResponse.length} chars`, {
+        preview: finalRawResponse.substring(0, 300),
+        hasTools: false,
+    });
+
+    if (!finalThinkingContent && finalRawResponse.includes('<thinking>')) {
+        const { thinkingContent: extracted } = extractThinking(finalRawResponse);
+        if (extracted) {
+            finalThinkingContent = extracted;
+        }
+    }
+
+    if (finalThinkingContent) {
+        log.recordThinking(finalThinkingContent);
+        log.updateSummary({ thinkingChars: finalThinkingContent.length });
+        log.info('Handler', 'thinking', `剥离 thinking: ${finalThinkingContent.length} chars, 剩余正文 ${finalVisibleText.length} chars, clientRequested=${clientRequestedThinking}`);
+    }
+
+    let finalTextToSend: string;
+    // visibleText 现在始终是剥离 thinking 后的文本
+    const usedFallback = !streamer.hasSentText() && isRefusal(finalVisibleText);
+    if (usedFallback) {
+        if (isToolCapabilityQuestion(body)) {
+            log.info('Handler', 'refusal', '工具能力询问被拒绝 → 返回 Claude 能力描述');
+            finalTextToSend = CLAUDE_TOOLS_RESPONSE;
+        } else {
+            log.warn('Handler', 'refusal', `重试${MAX_REFUSAL_RETRIES}次后仍被拒绝 → 降级为 Claude 身份回复`);
+            finalTextToSend = CLAUDE_IDENTITY_RESPONSE;
+        }
+    } else {
+        finalTextToSend = streamer.finish();
+    }
+
+    if (!usedFallback && clientRequestedThinking && finalThinkingContent && !streamState.thinkingEmitted) {
+        emitAnthropicThinkingBlock(res, streamState, finalThinkingContent);
+    }
+
+    writeAnthropicTextDelta(res, streamState, finalTextToSend);
+
+    if (streamState.textBlockStarted) {
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop',
+            index: streamState.blockIndex,
+        });
+        streamState.blockIndex++;
+    }
+
+    writeSSE(res, 'message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: Math.ceil((streamer.hasSentText() ? (finalVisibleText || finalRawResponse) : finalTextToSend).length / 4) },
+    });
+    writeSSE(res, 'message_stop', { type: 'message_stop' });
+
+    const finalRecordedResponse = streamer.hasSentText()
+        ? sanitizeResponse(finalVisibleText)
+        : finalTextToSend;
+    log.recordFinalResponse(finalRecordedResponse);
+    log.complete(finalRecordedResponse.length, 'end_turn');
+
+    res.end();
+    } finally {
+        clearInterval(keepaliveInterval);
+    }
+}
+
 // ==================== 流式处理 ====================
 
-async function handleStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest): Promise<void> {
+async function handleStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger, clientRequestedThinking: boolean = false): Promise<void> {
     // 设置 SSE headers
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -578,10 +1149,15 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
         },
     });
 
+    // ★ 流式保活 — 注意：无工具的增量流式路径（handleDirectTextStream）有自己的 keepalive
+    // 这里的 keepalive 仅用于工具模式下的缓冲/续写期间
+    let keepaliveInterval: ReturnType<typeof setInterval> | undefined;
+
     let fullResponse = '';
     let sentText = '';
     let blockIndex = 0;
     let textBlockStarted = false;
+    let thinkingBlockEmitted = false;
 
     // 无工具模式：先缓冲全部响应再检测拒绝，如果是拒绝则重试
     let activeCursorReq = cursorReq;
@@ -589,21 +1165,65 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
     const executeStream = async () => {
         fullResponse = '';
+        const apiStart = Date.now();
+        let firstChunk = true;
+        log.startPhase('send', '发送到 Cursor');
         await sendCursorRequest(activeCursorReq, (event: CursorSSEEvent) => {
             if (event.type !== 'text-delta' || !event.delta) return;
+            if (firstChunk) { log.recordTTFT(); log.endPhase(); log.startPhase('response', '接收响应'); firstChunk = false; }
             fullResponse += event.delta;
-
-            // 有工具时始终缓冲，无工具时也缓冲（用于拒绝检测）
-            // 不再直接流式发送，统一在流结束后处理
         });
+        log.endPhase();
+        log.recordCursorApiTime(apiStart);
     };
 
     try {
+        if (!hasTools) {
+            await handleDirectTextStream(res, cursorReq, body, log, clientRequestedThinking, {
+                blockIndex,
+                textBlockStarted,
+                thinkingEmitted: thinkingBlockEmitted,
+            });
+            return;
+        }
+
+        // 工具模式：创建 keepalive（无工具路径已在 handleDirectTextStream 内部处理）
+        keepaliveInterval = setInterval(() => {
+            try {
+                res.write(': keepalive\n\n');
+                // @ts-expect-error flush exists on ServerResponse when compression is used
+                if (typeof res.flush === 'function') res.flush();
+            } catch { /* connection already closed, ignore */ }
+        }, 15000);
+
         await executeStream();
 
-        console.log(`[Handler] 原始响应 (${fullResponse.length} chars, tools=${hasTools}): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+        log.recordRawResponse(fullResponse);
+        log.info('Handler', 'response', `原始响应: ${fullResponse.length} chars`, {
+            preview: fullResponse.substring(0, 300),
+            hasTools,
+        });
 
-        // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
+        // ★ Thinking 提取（在拒绝检测之前，防止 thinking 内容触发 isRefusal 误判）
+        // 始终剥离 thinking 标签，避免泄漏到最终文本中
+        let thinkingContent = '';
+        if (fullResponse.includes('<thinking>')) {
+            const { thinkingContent: extracted, strippedText } = extractThinking(fullResponse);
+            if (extracted) {
+                thinkingContent = extracted;
+                fullResponse = strippedText;
+                log.recordThinking(thinkingContent);
+                log.updateSummary({ thinkingChars: thinkingContent.length });
+                if (clientRequestedThinking) {
+                    log.info('Handler', 'thinking', `剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
+                } else {
+                    log.info('Handler', 'thinking', `剥离 thinking (非客户端请求): ${thinkingContent.length} chars, 剩余 ${fullResponse.length} chars`);
+                }
+            }
+        }
+
+        // 拒绝检测 + 自动重试
+        // fullResponse 已在上方剥离 thinking 标签，可直接用于拒绝检测
         const shouldRetryRefusal = () => {
             if (!isRefusal(fullResponse)) return false;
             if (hasTools && hasToolCalls(fullResponse)) return false;
@@ -612,53 +1232,65 @@ async function handleStream(res: Response, cursorReq: CursorChatRequest, body: A
 
         while (shouldRetryRefusal() && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[Handler] 检测到拒绝（第${retryCount}次），自动重试...原始: ${fullResponse.substring(0, 100)}`);
+            log.warn('Handler', 'retry', `检测到拒绝（第${retryCount}次），自动重试`, { preview: fullResponse.substring(0, 200) });
+            log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, retryCount - 1);
             activeCursorReq = await convertToCursorRequest(retryBody);
             await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+            // 重试后也需要剥离 thinking 标签
+            if (fullResponse.includes('<thinking>')) {
+                const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullResponse);
+                if (retryThinking) {
+                    thinkingContent = retryThinking;
+                    fullResponse = retryStripped;
+                }
+            }
+            log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
         }
 
         if (shouldRetryRefusal()) {
             if (!hasTools) {
                 // 工具能力询问 → 返回详细能力描述；其他 → 返回身份回复
                 if (isToolCapabilityQuestion(body)) {
-                    console.log(`[Handler] 工具能力询问被拒绝，返回 Claude 能力描述`);
+                    log.info('Handler', 'refusal', '工具能力询问被拒绝 → 返回 Claude 能力描述');
                     fullResponse = CLAUDE_TOOLS_RESPONSE;
                 } else {
-                    console.log(`[Handler] 重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                    log.warn('Handler', 'refusal', `重试${MAX_REFUSAL_RETRIES}次后仍被拒绝 → 降级为 Claude 身份回复`);
                     fullResponse = CLAUDE_IDENTITY_RESPONSE;
                 }
             } else {
                 // 工具模式拒绝：不返回纯文本（会让 Claude Code 误认为任务完成）
                 // 返回一个合理的纯文本，让它以 end_turn 结束，Claude Code 会根据上下文继续
-                console.log(`[Handler] 工具模式下拒绝且无工具调用，返回简短引导文本`);
+                log.warn('Handler', 'refusal', '工具模式下拒绝且无工具调用 → 返回简短引导文本');
                 fullResponse = 'Let me proceed with the task.';
             }
         }
 
-        // 极短响应重试（可能是连接中断）
-        if (hasTools && fullResponse.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
+        // 极短响应重试（仅在响应几乎为空时触发，避免误判正常短回答如 "2" 或 "25岁"）
+        const trimmed = fullResponse.trim();
+        if (hasTools && trimmed.length < 3 && !trimmed.match(/\d/) && retryCount < MAX_REFUSAL_RETRIES) {
             retryCount++;
-            console.log(`[Handler] 响应过短 (${fullResponse.length} chars)，重试第${retryCount}次`);
+            log.warn('Handler', 'retry', `响应过短 (${fullResponse.length} chars: "${trimmed}")，重试第${retryCount}次`);
             activeCursorReq = await convertToCursorRequest(body);
             await executeStream();
-            console.log(`[Handler] 重试响应 (${fullResponse.length} chars): ${fullResponse.substring(0, 200)}${fullResponse.length > 200 ? '...' : ''}`);
+            log.info('Handler', 'retry', `重试响应: ${fullResponse.length} chars`, { preview: fullResponse.substring(0, 200) });
         }
 
         // 流完成后，处理完整响应
         // ★ 内部截断续写：如果模型输出过长被截断（常见于写大文件），Proxy 内部分段续写，然后拼接成完整响应
         // 这样可以确保工具调用（如 Write）不会横跨两次 API 响应而退化为纯文本
-        const MAX_AUTO_CONTINUE = 6;
+        const MAX_AUTO_CONTINUE = 3;
         let continueCount = 0;
+        let consecutiveSmallAdds = 0; // 连续小增量计数
         
         // 保存原始请求的消息快照（不含续写追加的消息）
         const originalMessages = [...activeCursorReq.messages];
         
-        while (hasTools && isTruncated(fullResponse) && continueCount < MAX_AUTO_CONTINUE) {
+        while (shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
             continueCount++;
             const prevLength = fullResponse.length;
-            console.log(`[Handler] ⚠️ 内部检测到截断 (${fullResponse.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
+            log.warn('Handler', 'continuation', `内部检测到截断 (${fullResponse.length} chars)，隐式续写 (第${continueCount}次)`);
+            log.updateSummary({ continuationCount: continueCount });
             
             // 提取截断点的最后一段文本作为上下文锚点
             const anchorLength = Math.min(300, fullResponse.length);
@@ -699,7 +1331,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             });
 
             if (continuationResponse.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 续写返回空响应，停止续写`);
+                log.warn('Handler', 'continuation', '续写返回空响应，停止续写');
                 break;
             }
 
@@ -708,20 +1340,55 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             const deduped = deduplicateContinuation(fullResponse, continuationResponse);
             fullResponse += deduped;
             if (deduped.length !== continuationResponse.length) {
-                console.log(`[Handler] 续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
+                log.debug('Handler', 'continuation', `续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
             }
-            console.log(`[Handler] 续写拼接完成: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
+            log.info('Handler', 'continuation', `续写拼接完成: ${prevLength} → ${fullResponse.length} chars (+${deduped.length})`);
 
             // ★ 无进展检测：去重后没有新内容，说明模型在重复自己，继续续写无意义
             if (deduped.trim().length === 0) {
-                console.log(`[Handler] ⚠️ 续写内容全部为重复，停止续写`);
+                log.warn('Handler', 'continuation', '续写内容全部为重复，停止续写');
                 break;
+            }
+
+            // ★ 最小进展检测：去重后新增内容过少（<100 chars），模型几乎已完成
+            if (deduped.trim().length < 100) {
+                log.info('Handler', 'continuation', `续写新增内容过少 (${deduped.trim().length} chars < 100)，停止续写`);
+                break;
+            }
+
+            // ★ 连续小增量检测：连续2次增量 < 500 chars，说明模型已经在挤牙膏
+            if (deduped.trim().length < 500) {
+                consecutiveSmallAdds++;
+                if (consecutiveSmallAdds >= 2) {
+                    log.info('Handler', 'continuation', `连续 ${consecutiveSmallAdds} 次小增量续写，停止续写`);
+                    break;
+                }
+            } else {
+                consecutiveSmallAdds = 0;
             }
         }
 
-        let stopReason = (hasTools && isTruncated(fullResponse)) ? 'max_tokens' : 'end_turn';
+        let stopReason = shouldAutoContinueTruncatedToolResponse(fullResponse, hasTools) ? 'max_tokens' : 'end_turn';
         if (stopReason === 'max_tokens') {
-            console.log(`[Handler] ⚠️ ${MAX_AUTO_CONTINUE}次隐式续写后仍受限于截断 (${fullResponse.length} chars)，设置 stop_reason=max_tokens`);
+            log.warn('Handler', 'truncation', `${MAX_AUTO_CONTINUE}次续写后仍截断 (${fullResponse.length} chars) → stop_reason=max_tokens`);
+        }
+
+        // ★ Thinking 块发送：仅 GUI 插件（enabled）才发 thinking content block
+        // Claude Code（adaptive）需要密码学 signature 验证，无法伪造，所以保留标签在正文中
+        log.startPhase('stream', 'SSE 输出');
+        if (clientRequestedThinking && thinkingContent) {
+            writeSSE(res, 'content_block_start', {
+                type: 'content_block_start', index: blockIndex,
+                content_block: { type: 'thinking', thinking: '' },
+            });
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta', index: blockIndex,
+                delta: { type: 'thinking_delta', thinking: thinkingContent },
+            });
+            writeSSE(res, 'content_block_stop', {
+                type: 'content_block_stop', index: blockIndex,
+            });
+            blockIndex++;
         }
 
         if (hasTools) {
@@ -737,7 +1404,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
             ) {
                 toolChoiceRetry++;
-                console.log(`[Handler] tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试...`);
+                log.warn('Handler', 'retry', `tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
 
                 // 在现有 Cursor 请求中追加强制 user 消息（不重新转换整个请求，代价最小）
                 const forceMsg: CursorMessage = {
@@ -760,7 +1427,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 ({ toolCalls, cleanText } = parseToolCalls(fullResponse));
             }
             if (toolChoice?.type === 'any' && toolCalls.length === 0) {
-                console.log(`[Handler] tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
+                log.warn('Handler', 'toolparse', `tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
             }
 
 
@@ -769,7 +1436,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
                 // Check if the residual text is a known refusal, if so, drop it completely!
                 if (REFUSAL_PATTERNS.some(p => p.test(cleanText))) {
-                    console.log(`[Handler] Supressed refusal text generated during tool usage: ${cleanText.substring(0, 100)}...`);
+                    log.info('Handler', 'sanitize', `抑制工具调用中的拒绝文本`, { preview: cleanText.substring(0, 200) });
                     cleanText = '';
                 }
 
@@ -828,14 +1495,13 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
                 let textToSend = fullResponse;
 
                 // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
-                // 长响应（如模型在写报告）中可能碰巧包含某个宽泛的拒绝关键词，不应被误判
-                // 截断响应（stopReason=max_tokens）一定不是拒绝
+                // fullResponse 已被剥离 thinking 标签
                 const isShortResponse = fullResponse.trim().length < 500;
                 const startsWithRefusal = isRefusal(fullResponse.substring(0, 300));
                 const isActualRefusal = stopReason !== 'max_tokens' && (isShortResponse ? isRefusal(fullResponse) : startsWithRefusal);
 
                 if (isActualRefusal) {
-                    console.log(`[Handler] Supressed complete refusal without tools: ${fullResponse.substring(0, 100)}...`);
+                    log.info('Handler', 'sanitize', `抑制无工具的完整拒绝响应`, { preview: fullResponse.substring(0, 200) });
                     textToSend = 'I understand the request. Let me proceed with the appropriate action. Could you clarify what specific task you would like me to perform?';
                 }
 
@@ -890,11 +1556,19 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
         writeSSE(res, 'message_stop', { type: 'message_stop' });
 
+        // ★ 记录完成
+        log.recordFinalResponse(fullResponse);
+        log.complete(fullResponse.length, stopReason);
+
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
+        log.fail(message);
         writeSSE(res, 'error', {
             type: 'error', error: { type: 'api_error', message },
         });
+    } finally {
+        // ★ 清除保活定时器
+        clearInterval(keepaliveInterval);
     }
 
     res.end();
@@ -902,35 +1576,84 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
 
 // ==================== 非流式处理 ====================
 
-async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest): Promise<void> {
+async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body: AnthropicRequest, log: RequestLogger, clientRequestedThinking: boolean = false): Promise<void> {
+    // ★ 非流式保活：手动设置 chunked 响应，在缓冲期间每 15s 发送空白字符保活
+    // JSON.parse 会忽略前导空白，所以客户端解析不受影响
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const keepaliveInterval = setInterval(() => {
+        try {
+            res.write(' ');
+            // @ts-expect-error flush exists on ServerResponse when compression is used
+            if (typeof res.flush === 'function') res.flush();
+        } catch { /* connection already closed, ignore */ }
+    }, 15000);
+
+    try {
+    log.startPhase('send', '发送到 Cursor (非流式)');
+    const apiStart = Date.now();
     let fullText = await sendCursorRequestFull(cursorReq);
+    log.recordTTFT();
+    log.recordCursorApiTime(apiStart);
+    log.recordRawResponse(fullText);
+    log.startPhase('response', '处理响应');
     const hasTools = (body.tools?.length ?? 0) > 0;
     let activeCursorReq = cursorReq;
     let retryCount = 0;
 
-    console.log(`[Handler] 非流式原始响应 (${fullText.length} chars, tools=${hasTools}): ${fullText.substring(0, 300)}${fullText.length > 300 ? '...' : ''}`);
+    log.info('Handler', 'response', `非流式原始响应: ${fullText.length} chars`, {
+        preview: fullText.substring(0, 300),
+        hasTools,
+    });
 
-    // 拒绝检测 + 自动重试（工具模式和非工具模式均生效）
-    const shouldRetry = () => isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
+    // ★ Thinking 提取（在拒绝检测之前）
+    // 始终剥离 thinking 标签，避免泄漏到最终文本中
+    let thinkingContent = '';
+    if (fullText.includes('<thinking>')) {
+        const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
+        if (extracted) {
+            thinkingContent = extracted;
+            fullText = strippedText;
+            if (clientRequestedThinking) {
+                log.info('Handler', 'thinking', `非流式剥离 thinking → content block: ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
+            } else {
+                log.info('Handler', 'thinking', `非流式剥离 thinking (非客户端请求): ${thinkingContent.length} chars, 剩余 ${fullText.length} chars`);
+            }
+        }
+    }
+
+    // 拒绝检测 + 自动重试
+    // fullText 已在上方剥离 thinking 标签，可直接用于拒绝检测
+    const shouldRetry = () => {
+        return isRefusal(fullText) && !(hasTools && hasToolCalls(fullText));
+    };
 
     if (shouldRetry()) {
         for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
             retryCount++;
-            console.log(`[Handler] 非流式：检测到拒绝（第${retryCount}次重试）...原始: ${fullText.substring(0, 100)}`);
+            log.warn('Handler', 'retry', `非流式检测到拒绝（第${retryCount}次重试）`, { preview: fullText.substring(0, 200) });
+            log.updateSummary({ retryCount });
             const retryBody = buildRetryRequest(body, attempt);
             activeCursorReq = await convertToCursorRequest(retryBody);
             fullText = await sendCursorRequestFull(activeCursorReq);
+            // 重试后也需要剥离 thinking 标签
+            if (fullText.includes('<thinking>')) {
+                const { thinkingContent: retryThinking, strippedText: retryStripped } = extractThinking(fullText);
+                if (retryThinking) {
+                    thinkingContent = retryThinking;
+                    fullText = retryStripped;
+                }
+            }
             if (!shouldRetry()) break;
         }
         if (shouldRetry()) {
             if (hasTools) {
-                console.log(`[Handler] 非流式：工具模式下拒绝，引导模型输出`);
+                log.warn('Handler', 'refusal', '非流式工具模式下拒绝 → 引导模型输出');
                 fullText = 'I understand the request. Let me analyze the information and proceed with the appropriate action.';
             } else if (isToolCapabilityQuestion(body)) {
-                console.log(`[Handler] 非流式：工具能力询问被拒绝，返回 Claude 能力描述`);
+                log.info('Handler', 'refusal', '非流式工具能力询问被拒绝 → 返回 Claude 能力描述');
                 fullText = CLAUDE_TOOLS_RESPONSE;
             } else {
-                console.log(`[Handler] 非流式：重试${MAX_REFUSAL_RETRIES}次后仍被拒绝，返回 Claude 身份回复`);
+                log.warn('Handler', 'refusal', `非流式重试${MAX_REFUSAL_RETRIES}次后仍被拒绝 → 降级为 Claude 身份回复`);
                 fullText = CLAUDE_IDENTITY_RESPONSE;
             }
         }
@@ -939,23 +1662,25 @@ async function handleNonStream(res: Response, cursorReq: CursorChatRequest, body
     // ★ 极短响应重试（可能是连接中断）
     if (hasTools && fullText.trim().length < 10 && retryCount < MAX_REFUSAL_RETRIES) {
         retryCount++;
-        console.log(`[Handler] 非流式：响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
+        log.warn('Handler', 'retry', `非流式响应过短 (${fullText.length} chars)，重试第${retryCount}次`);
         activeCursorReq = await convertToCursorRequest(body);
         fullText = await sendCursorRequestFull(activeCursorReq);
-        console.log(`[Handler] 非流式：重试响应 (${fullText.length} chars): ${fullText.substring(0, 200)}${fullText.length > 200 ? '...' : ''}`);
+        log.info('Handler', 'retry', `非流式重试响应: ${fullText.length} chars`, { preview: fullText.substring(0, 200) });
     }
 
     // ★ 内部截断续写（与流式路径对齐）
     // Claude CLI 使用非流式模式时，写大文件最容易被截断
     // 在 proxy 内部完成续写，确保工具调用参数完整
-    const MAX_AUTO_CONTINUE = 6;
+    const MAX_AUTO_CONTINUE = 3;
     let continueCount = 0;
+    let consecutiveSmallAdds = 0; // 连续小增量计数
     const originalMessages = [...activeCursorReq.messages];
 
-    while (hasTools && isTruncated(fullText) && continueCount < MAX_AUTO_CONTINUE) {
+    while (shouldAutoContinueTruncatedToolResponse(fullText, hasTools) && continueCount < MAX_AUTO_CONTINUE) {
         continueCount++;
         const prevLength = fullText.length;
-        console.log(`[Handler] ⚠️ 非流式：内部检测到截断 (${fullText.length} chars)，Proxy 将隐式请求无缝续写 (第${continueCount}次)...`);
+        log.warn('Handler', 'continuation', `非流式检测到截断 (${fullText.length} chars)，隐式续写 (第${continueCount}次)`);
+        log.updateSummary({ continuationCount: continueCount });
 
         const anchorLength = Math.min(300, fullText.length);
         const anchorText = fullText.slice(-anchorLength);
@@ -988,7 +1713,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         const continuationResponse = await sendCursorRequestFull(continuationReq);
 
         if (continuationResponse.trim().length === 0) {
-            console.log(`[Handler] ⚠️ 非流式续写返回空响应，停止续写`);
+            log.warn('Handler', 'continuation', '非流式续写返回空响应，停止续写');
             break;
         }
 
@@ -996,22 +1721,45 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         const deduped = deduplicateContinuation(fullText, continuationResponse);
         fullText += deduped;
         if (deduped.length !== continuationResponse.length) {
-            console.log(`[Handler] 非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
+            log.debug('Handler', 'continuation', `非流式续写去重: 移除了 ${continuationResponse.length - deduped.length} chars 的重复内容`);
         }
-        console.log(`[Handler] 非流式续写拼接完成: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
+        log.info('Handler', 'continuation', `非流式续写拼接完成: ${prevLength} → ${fullText.length} chars (+${deduped.length})`);
 
         // ★ 无进展检测：去重后没有新内容，停止续写
         if (deduped.trim().length === 0) {
-            console.log(`[Handler] ⚠️ 非流式续写内容全部为重复，停止续写`);
+            log.warn('Handler', 'continuation', '非流式续写内容全部为重复，停止续写');
             break;
+        }
+
+        // ★ 最小进展检测：去重后新增内容过少（<100 chars），模型几乎已完成
+        if (deduped.trim().length < 100) {
+            log.info('Handler', 'continuation', `非流式续写新增内容过少 (${deduped.trim().length} chars < 100)，停止续写`);
+            break;
+        }
+
+        // ★ 连续小增量检测：连续2次增量 < 500 chars，说明模型已经在挤牙膏
+        if (deduped.trim().length < 500) {
+            consecutiveSmallAdds++;
+            if (consecutiveSmallAdds >= 2) {
+                log.info('Handler', 'continuation', `非流式连续 ${consecutiveSmallAdds} 次小增量续写，停止续写`);
+                break;
+            }
+        } else {
+            consecutiveSmallAdds = 0;
         }
     }
 
     const contentBlocks: AnthropicContentBlock[] = [];
+
+    // ★ Thinking 内容作为第一个 content block（仅客户端原生请求时）
+    if (clientRequestedThinking && thinkingContent) {
+        contentBlocks.push({ type: 'thinking' as any, thinking: thinkingContent } as any);
+    }
+
     // ★ 截断检测：代码块/XML 未闭合时，返回 max_tokens 让 Claude Code 自动继续
-    let stopReason = (hasTools && isTruncated(fullText)) ? 'max_tokens' : 'end_turn';
+    let stopReason = shouldAutoContinueTruncatedToolResponse(fullText, hasTools) ? 'max_tokens' : 'end_turn';
     if (stopReason === 'max_tokens') {
-        console.log(`[Handler] ⚠️ 非流式检测到截断响应 (${fullText.length} chars)，设置 stop_reason=max_tokens`);
+        log.warn('Handler', 'truncation', `非流式检测到截断响应 (${fullText.length} chars) → stop_reason=max_tokens`);
     }
 
     if (hasTools) {
@@ -1027,7 +1775,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
         ) {
             toolChoiceRetry++;
-            console.log(`[Handler] 非流式：tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试...`);
+            log.warn('Handler', 'retry', `非流式 tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
 
             const forceMessages = [
                 ...activeCursorReq.messages,
@@ -1050,14 +1798,14 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             ({ toolCalls, cleanText } = parseToolCalls(fullText));
         }
         if (toolChoice?.type === 'any' && toolCalls.length === 0) {
-            console.log(`[Handler] 非流式：tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
+            log.warn('Handler', 'toolparse', `非流式 tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
         }
 
         if (toolCalls.length > 0) {
             stopReason = 'tool_use';
 
             if (isRefusal(cleanText)) {
-                console.log(`[Handler] Supressed refusal text generated during non-stream tool usage: ${cleanText.substring(0, 100)}...`);
+                log.info('Handler', 'sanitize', `非流式抑制工具调用中的拒绝文本`, { preview: cleanText.substring(0, 200) });
                 cleanText = '';
             }
 
@@ -1076,11 +1824,12 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         } else {
             let textToSend = fullText;
             // ★ 同样仅对短响应或开头匹配的进行拒绝压制
+            // fullText 已被剥离 thinking 标签
             const isShort = fullText.trim().length < 500;
             const startsRefusal = isRefusal(fullText.substring(0, 300));
             const isRealRefusal = stopReason !== 'max_tokens' && (isShort ? isRefusal(fullText) : startsRefusal);
             if (isRealRefusal) {
-                console.log(`[Handler] Supressed pure text refusal (non-stream): ${fullText.substring(0, 100)}...`);
+                log.info('Handler', 'sanitize', `非流式抑制纯文本拒绝响应`, { preview: fullText.substring(0, 200) });
                 textToSend = 'Let me proceed with the task.';
             }
             contentBlocks.push({ type: 'text', text: textToSend });
@@ -1104,7 +1853,24 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         },
     };
 
-    res.json(response);
+    clearInterval(keepaliveInterval);
+    res.end(JSON.stringify(response));
+
+    // ★ 记录完成
+    log.recordFinalResponse(fullText);
+    log.complete(fullText.length, stopReason);
+
+    } catch (err: unknown) {
+        clearInterval(keepaliveInterval);
+        const message = err instanceof Error ? err.message : String(err);
+        log.fail(message);
+        try {
+            res.end(JSON.stringify({
+                type: 'error',
+                error: { type: 'api_error', message },
+            }));
+        } catch { /* response already ended */ }
+    }
 }
 
 // ==================== SSE 工具函数 ====================

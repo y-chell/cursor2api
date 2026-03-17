@@ -11,6 +11,7 @@ export interface AnthropicRequest {
     temperature?: number;
     top_p?: number;
     stop_sequences?: string[];
+    thinking?: { type: 'enabled' | 'disabled' | 'adaptive'; budget_tokens?: number };
 }
 
 /** tool_choice 控制模型是否必须调用工具
@@ -32,7 +33,7 @@ export interface AnthropicContentBlock {
     type: 'text' | 'tool_use' | 'tool_result' | 'image';
     text?: string;
     // image fields
-    source?: { type: string; media_type?: string; data: string };
+    source?: { type: string; media_type?: string; data: string; url?: string };
     // tool_use fields
     id?: string;
     name?: string;
@@ -104,12 +105,34 @@ export interface AppConfig {
     timeout: number;
     proxy?: string;
     cursorModel: string;
+    authTokens?: string[];  // API 鉴权 token 列表，为空则不鉴权
     vision?: {
         enabled: boolean;
         mode: 'ocr' | 'api';
         baseUrl: string;
         apiKey: string;
         model: string;
+        proxy?: string;  // vision 独立代理（不影响 Cursor API 直连）
+    };
+    compression?: {
+        enabled: boolean;          // 是否启用历史消息压缩
+        level: 1 | 2 | 3;         // 压缩级别: 1=轻度, 2=中等(默认), 3=激进
+        keepRecent: number;        // 保留最近 N 条消息不压缩
+        earlyMsgMaxChars: number;  // 早期消息最大字符数
+    };
+    thinking?: {
+        enabled: boolean;          // 是否启用 thinking（最高优先级，覆盖客户端请求）
+    };
+    logging?: {
+        file_enabled: boolean;     // 是否启用日志文件持久化
+        dir: string;               // 日志文件存储目录
+        max_days: number;          // 日志保留天数
+    };
+    tools?: {
+        schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式
+        descriptionMaxLength: number;                     // 描述截断长度 (0=不截断)
+        includeOnly?: string[];                           // 白名单：只保留的工具名
+        exclude?: string[];                               // 黑名单：要排除的工具名
     };
     fingerprint: {
         userAgent: string;

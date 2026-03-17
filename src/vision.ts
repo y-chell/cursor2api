@@ -1,6 +1,6 @@
 import { getConfig } from './config.js';
 import type { AnthropicMessage, AnthropicContentBlock } from './types.js';
-import { getProxyFetchOptions } from './proxy-agent.js';
+import { getVisionProxyFetchOptions } from './proxy-agent.js';
 import { createWorker } from 'tesseract.js';
 
 export async function applyVisionInterceptor(messages: AnthropicMessage[]): Promise<void> {
@@ -8,6 +8,7 @@ export async function applyVisionInterceptor(messages: AnthropicMessage[]): Prom
     if (!config.vision?.enabled) return;
 
     for (const msg of messages) {
+        if (msg.role !== 'user') continue;
         if (!Array.isArray(msg.content)) continue;
 
         let hasImages = false;
@@ -27,10 +28,8 @@ export async function applyVisionInterceptor(messages: AnthropicMessage[]): Prom
             try {
                 let descriptions = '';
                 if (config.vision.mode === 'ocr') {
-                    console.log(`[Vision] 启用纯本地 OCR 模式，正在提取 ${imagesToAnalyze.length} 张图片上的文字... (无需 API Key)`);
                     descriptions = await processWithLocalOCR(imagesToAnalyze);
                 } else {
-                    console.log(`[Vision] 启用外部 API 模式，正在分析 ${imagesToAnalyze.length} 张图片...`);
                     descriptions = await callVisionAPI(imagesToAnalyze);
                 }
 
@@ -61,12 +60,13 @@ async function processWithLocalOCR(imageBlocks: AnthropicContentBlock[]): Promis
         const img = imageBlocks[i];
         let imageSource: string | Buffer = '';
 
-        if (img.type === 'image' && img.source?.data) {
-            if (img.source.type === 'base64') {
+        if (img.type === 'image' && img.source) {
+            const sourceData = img.source.data || img.source.url;
+            if (img.source.type === 'base64' && sourceData) {
                 const mime = img.source.media_type || 'image/jpeg';
-                imageSource = `data:${mime};base64,${img.source.data}`;
-            } else if (img.source.type === 'url') {
-                imageSource = img.source.data;
+                imageSource = `data:${mime};base64,${sourceData}`;
+            } else if (img.source.type === 'url' && sourceData) {
+                imageSource = sourceData;
             }
         }
 
@@ -94,15 +94,16 @@ async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<stri
     ];
 
     for (const img of imageBlocks) {
-        if (img.type === 'image' && img.source?.data) {
+        if (img.type === 'image' && img.source) {
+            const sourceData = img.source.data || img.source.url;
             let url = '';
             // If it's a raw base64 string
-            if (img.source.type === 'base64') {
+            if (img.source.type === 'base64' && sourceData) {
                 const mime = img.source.media_type || 'image/jpeg';
-                url = `data:${mime};base64,${img.source.data}`;
-            } else if (img.source.type === 'url') {
-                // Handle remote URLs natively mapped from OpenAI payloads
-                url = img.source.data;
+                url = `data:${mime};base64,${sourceData}`;
+            } else if (img.source.type === 'url' && sourceData) {
+                // Handle remote URLs natively mapped from OpenAI/Anthropic payloads
+                url = sourceData;
             }
             if (url) {
                 parts.push({ type: 'image_url', image_url: { url } });
@@ -123,7 +124,7 @@ async function callVisionAPI(imageBlocks: AnthropicContentBlock[]): Promise<stri
             'Authorization': `Bearer ${config.apiKey}`
         },
         body: JSON.stringify(payload),
-        ...getProxyFetchOptions(),
+        ...getVisionProxyFetchOptions(),
     } as any);
 
     if (!res.ok) {

@@ -1,5 +1,134 @@
 # Changelog
 
+## v2.7.2 (2026-03-17)
+
+### 🖥️ 日志查看器全面升级
+
+- **前端重构为独立静态文件**：`logs.html` / `logs.css` / `logs.js` 分离到 `public/` 目录，告别单文件嵌入，更易维护
+- **🌙 日/夜主题切换**：一键切换明暗主题（☀️/🌙），自动检测系统偏好，选择持久化到 `localStorage`
+- **暗色主题完整适配**：深蓝渐变背景，所有 UI 元素（标签、状态灯、代码块、JSON 高亮）均有独立暗色配色
+- **标题提取修复**：过滤 `<system-reminder>...</system-reminder>` 注入内容和 Claude Code `"First, think step by step..."` 引导语，确保标题显示用户真实提问
+- **登录页同步更新**：独立 `login.html`，视觉风格与日志页一致
+
+### 🧹 工程化改进
+
+- **移除 `WELL_KNOWN_TOOLS` 白名单**：所有工具统一保留描述（截取前 50 字符），简化逻辑
+- **`config.yaml` 停止追踪**：含敏感 token 的配置文件加入 `.gitignore`，不再上传
+- **新增 `config.yaml.example`**：配置模板，安全默认值，用户只需 `cp config.yaml.example config.yaml`
+- **`.gitignore` 清理**：去除重复条目，排除开发截图文件
+- **Thinking 默认关闭**：`thinking.enabled` 默认值改为 `false`
+- **Express v5 兼容**：修复 `path-to-regexp` 通配符路由报错，改用 `express.static` 中间件
+- **CSS 兼容性**：补充标准 `background-clip` 属性
+
+### 📝 README 大幅更新
+
+- 新增日志查看器功能介绍（特性列表 + 鉴权说明）
+- 新增配置项速查表格
+- 新增环境变量参考表
+- 项目结构补充 `public/` 目录说明
+- 配置说明改为引导用户从 `config.yaml.example` 复制
+
+---
+
+## v2.7.1 (2026-03-16)
+
+### 🗜️ 智能历史压缩算法
+
+- **修复 JSON Action 块截断**：之前朴素的 `substring` 截断会切断 `` ```json action `` 代码块，产生未闭合标记和不完整 JSON，严重误导模型。现在对包含工具调用的 assistant 消息，提取工具名生成摘要（如 `[Executed: Write, Read]`），不再做子串截断
+- **工具结果头尾保留**：工具结果截断从"只保留头部"改为 **60% 头 + 40% 尾**，确保错误信息、stack trace 等末尾关键内容不丢失
+- **修复非工具模式偏移量**：few-shot 消息跳过偏移量从硬编码 `+2` 改为动态计算 `hasTools ? 2 : 0`，修复非工具模式下前2条消息无法参与压缩的问题
+- **自然边界截断**：普通文本在换行符处截断，避免切断单词或代码
+
+### ⚙️ 可配置压缩系统
+
+- 新增 `compression` 配置段（config.yaml），支持：
+  - `enabled`：压缩开关（`true`/`false`），关闭后所有消息原样保留
+  - `level`：压缩级别 1-3（轻度/中等/激进），每级预设不同的保留消息数和字符限制
+  - `keep_recent`：高级选项，覆盖级别预设的保留消息数
+  - `early_msg_max_chars`：高级选项，覆盖级别预设的早期消息字符上限
+- 支持环境变量 `COMPRESSION_ENABLED` / `COMPRESSION_LEVEL`，方便 Docker 部署
+
+### 🔐 日志查看器鉴权
+
+- 配置了 `auth_tokens` 后，访问 `/logs` 及所有 `/api/logs*` 端点需要验证身份
+- 精美的登录页面，输入 token 后通过 `/api/stats` 验证有效性
+- Token 存入 `localStorage`，刷新页面无需重新输入
+- 支持 query 参数 `?token=xxx`、`Authorization` header、`x-api-key` 三种传入方式
+- 页面右上角显示退出按钮，清除缓存并跳回登录页
+- 未配置 `auth_tokens` 时保持完全开放（向后兼容）
+
+### 🧠 Thinking 拒绝误判修复
+
+- **修复 thinking 触发拒绝检测**：模型的 `<thinking>` 内容中包含反思性语言（如 "haven't given a specific task"），被拒绝检测正则误判为拒绝响应
+- 拒绝检测现在先剥离 `<thinking>` 标签内容，仅对实际输出文本进行检测
+- 流式和非流式路径均已修复
+
+### 🧠 OpenAI 格式 Thinking 默认启用
+
+- OpenAI Chat Completions 协议不再依赖模型名包含 `thinking` 或传入 `reasoning_effort` 才启用
+- 所有 OpenAI 格式请求默认启用 thinking，确保 Claude Code 等客户端始终获得推理内容
+
+---
+
+## v2.7.0 (2026-03-16)
+
+### 🔐 API Token 鉴权
+
+- **公网部署安全**：新增 `auth_tokens` 配置项，支持 Bearer token 鉴权
+- 支持多 token（数组格式）、环境变量 `AUTH_TOKEN`、`x-api-key` 头
+- 未配置时全部放行（向后兼容），GET 请求和 /health 端点无需鉴权
+- 启动 banner 显示鉴权状态
+
+### 🧠 Thinking 支持（客户端驱动）
+
+- **Anthropic 协议**：请求体传 `thinking.type = "enabled"` 即启用
+- **OpenAI 协议**：模型名含 `thinking` 或传 `reasoning_effort` 参数即启用
+- 系统提示词注入 `<thinking>` 引导，模型输出自动提取
+- Anthropic 返回 `thinking` content block，OpenAI 返回 `reasoning_content` 字段
+- 提取在拒绝检测之前执行，防止 thinking 内容触发误判
+- 未启用时仍会剥离 thinking 标签（防误判），但内容不返回
+
+### 🔧 已知工具跳过描述（已在 v2.7.2 移除）
+
+- `WELL_KNOWN_TOOLS` 集合中的 17 个常用工具（Read、Write、Bash 等）不再生成描述文本
+- 减少约 30% 工具指令输入，节省上下文空间
+
+### 📊 动态工具结果预算
+
+- `getToolResultBudget()` 替代固定 15K 限制
+- 根据当前上下文大小动态调整：小上下文 20K → 大上下文 8K
+- `setCurrentContextChars()` 跟踪实际上下文字符数
+
+### 🛡️ isTruncated 重写
+
+- 重新实现截断检测逻辑，正确处理工具调用 JSON 中的反引号
+- 优先检查 `` ```json action`` 代码块，避免 JSON 字符串值内的反引号导致误判
+- 消除因误判导致的无限重试
+
+### 📦 response_format 支持
+
+- `OpenAIChatRequest` 新增 `response_format` 字段（`json_object` / `json_schema`）
+- JSON 格式请求自动追加格式指令到最后一条用户消息
+- `stripMarkdownJsonWrapper()` 自动剥离响应中的 markdown 代码块包装
+- 流式和非流式路径均支持
+
+### 🧹 计费头清除
+
+- 自动清除系统提示词中的 `x-anthropic-billing-header`
+- 防止模型将其判定为恶意伪造并触发注入警告
+
+### 🌐 Vision 独立代理
+
+- 新增 `vision.proxy` 配置项，图片分析 API 单独走代理
+- Cursor API 保持直连（国内可用），不因代理影响响应速度
+- 未配置时回退到全局 `proxy`
+
+### 🛡️ 新增拒绝模式
+
+- 补充 4 个 Cursor 新拒绝措辞：`isn't something I can help with`、`not something I can help with`、`scoped to answering questions about Cursor`、`falls outside`
+
+---
+
 ## v2.5.6 (2026-03-12)
 
 ### 🗜️ 渐进式历史压缩

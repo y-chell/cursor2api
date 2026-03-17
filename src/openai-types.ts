@@ -14,6 +14,10 @@ export interface OpenAIChatRequest {
     n?: number;
     frequency_penalty?: number;
     presence_penalty?: number;
+    response_format?: {
+        type: 'text' | 'json_object' | 'json_schema';
+        json_schema?: { name?: string; schema?: Record<string, unknown> };
+    };
 }
 
 export interface OpenAIMessage {
@@ -27,9 +31,12 @@ export interface OpenAIMessage {
 }
 
 export interface OpenAIContentPart {
-    type: 'text' | 'image_url';
+    type: 'text' | 'input_text' | 'image_url' | 'image' | 'input_image' | 'image_file';
     text?: string;
     image_url?: { url: string; detail?: string };
+    image_file?: { file_id: string; detail?: string };
+    // Anthropic-style image source (when type === 'image')
+    source?: { type: string; media_type?: string; data?: string; url?: string };
 }
 
 export interface OpenAITool {
