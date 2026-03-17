@@ -4,6 +4,29 @@
 
 > ⚠️ **版本说明**：当前 v2.7.3 统一 thinking 剥离逻辑、增强拒绝检测准确性、优化 Docker 部署配置。
 
+## 上游来源（Original）
+
+本项目为对上游项目的二次修改版本（非 Fork）。为便于跟踪原项目更新，请访问：
+
+- https://github.com/7836246/cursor2api
+
+## 与上游差异（This Fork Changes）
+
+- 新增 Cloudflare Workers 入口：`src/worker.ts`（使用 Node 兼容层桥接 Express）
+- 抽离 Express 初始化：`src/app.ts`（Worker 与 Node 复用）
+- Node 本地入口改为调用 `createApp()`：`src/index.ts`
+- 新增 `wrangler.toml`：启用 `nodejs_compat` 与 Worker 入口
+- 新增 `src/cloudflare-node.d.ts`：补充 `cloudflare:node` 类型声明
+
+## Cloudflare Workers 部署注意事项
+
+- `src/app.ts` 这类 Worker 与 Node 共享入口文件里，不要使用 `createRequire(import.meta.url)`、`require('../package.json')`、`__dirname`、`fs` 读取本地文件等 Node 文件系统假设来获取版本号或配置。
+- Cloudflare Worker 在部署校验阶段会实际加载入口模块；这类代码即使在本地 Node 正常，也可能在 Worker 运行时直接报错，例如：
+  `The argument 'path' must be a file URL object, a file URL string, or an absolute path string. Received 'undefined'`
+- 版本号这类信息，优先使用环境变量注入，例如 `process.env.npm_package_version`；如需构建标识，可退化为 `CF_PAGES_COMMIT_SHA` 的短 SHA。
+- `wrangler.toml` 里的 `name` 必须和 Cloudflare 上连接构建的 Worker 名称一致；否则 CI 会告警并覆盖名称，增加排查噪音。
+- 如果你后续再从上游合并 `src/app.ts`、`src/index.ts` 或构建配置，合并后先检查一遍 Cloudflare 兼容性，再推送到 GitHub。
+
 ## 原理
 
 ```
@@ -254,3 +277,83 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 ## License
 
 [MIT](LICENSE)
+
+## 2026-03-12 服务器 Docker 独立部署说明
+
+这个项目当前同时保留了两条运行路线：
+
+- Cloudflare Workers 路线：使用 `src/worker.ts`
+- 普通服务器 Node/Docker 路线：使用 `src/index.ts`
+
+两者不冲突。当前仓库中的 `Dockerfile` 和 `docker-compose.yml` 走的是普通服务器 Node 版本，不会启动 Worker 入口。
+
+### 推荐部署方式
+
+建议将它作为独立服务部署，使用单独的目录和单独的容器编排。
+
+
+### 反向代理建议
+
+不要直接暴露端口给公网，建议像 `newapi` / `cpa` 一样走域名反代。
+
+例如：
+
+- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+
+### 部署前检查项
+
+1. `config.yaml` 中的 `cursor_model` 是否符合当前实际需求
+2. 如果服务器需要代理，确认 `config.yaml` 或环境变量 `PROXY` 已配置
+3. 如果只是做服务器版备用实例，域名不要与 Cloudflare Workers 线上入口复用
+
+### 说明
+
+当前 `docker-compose.yml` 中保留了：
+
+- `init: true`
+
+这是为了容器内进程管理更稳，不影响 Cloudflare Workers 路线。
+
+## 2026-03-12 服务器终端直接部署命令
+
+如果你不想走 aaPanel 的编排编辑器，可以直接在服务器终端部署。
+
+### 1. 首次部署
+
+```bash
+git clone https://github.com/y-chell/cursor2api.git cursor2api-stack
+cd cursor2api-stack
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cursor2api
+```
+
+### 2. 后续更新
+
+```bash
+cd /path/to/cursor2api-stack
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 cursor2api
+```
+
+### 3. 反向代理目标
+
+服务启动成功后，反代到：
+
+- `http://127.0.0.1:3010`
+
+例如：
+
+- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+
+### 4. 部署后检查
+
+至少确认以下几点：
+
+1. `docker compose ps` 中 `cursor2api` 为 `Up`
+2. 日志里没有启动时报错
+3. 本机访问 `http://127.0.0.1:3010/health` 能返回状态
