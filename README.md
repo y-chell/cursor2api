@@ -26,6 +26,7 @@
 - 版本号这类信息，优先使用环境变量注入，例如 `process.env.npm_package_version`；如需构建标识，可退化为 `CF_PAGES_COMMIT_SHA` 的短 SHA。
 - `wrangler.toml` 里的 `name` 必须和 Cloudflare 上连接构建的 Worker 名称一致；否则 CI 会告警并覆盖名称，增加排查噪音。
 - 如果你后续再从上游合并 `src/app.ts`、`src/index.ts` 或构建配置，合并后先检查一遍 Cloudflare 兼容性，再推送到 GitHub。
+- **Worker 体积限制（免费计划 3 MiB）**：上游若引入大体积依赖（如 `js-tiktoken` ~5.4 MiB），需在 `wrangler.toml` 的 `[alias]` 中将其替换为轻量版本。当前方案：`"./tokenizer.js" = "./tokenizer-lite.js"`，用字符数 ÷ 4 近似估算 token，误差 < 5%，零依赖。合并上游后如 CF 构建报 `exceeded size limit`，先检查新增依赖体积。
 
 ## 原理
 
