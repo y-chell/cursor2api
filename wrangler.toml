@@ -5,7 +5,3 @@ compatibility_flags = ["nodejs_compat"]
 
 [build]
 command = "npm run build"
-
-# CF Worker 体积限制：用轻量字符估算替换 js-tiktoken（5.4 MiB）
-[alias]
-"js-tiktoken" = "./src/tiktoken-stub"
