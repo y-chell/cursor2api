@@ -317,7 +317,7 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 
 例如：
 
-- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+- `your-domain.example.com -> http://127.0.0.1:3010`
 
 ### 部署前检查项
 
@@ -367,7 +367,7 @@ docker compose logs --tail=100 cursor2api
 
 例如：
 
-- `cursor2api.aikey.us.ci -> http://127.0.0.1:3010`
+- `your-domain.example.com -> http://127.0.0.1:3010`
 
 ### 4. 部署后检查
 
