@@ -12,7 +12,7 @@ services:
     volumes:
       # 挂载配置文件（可选）——先从 config.yaml.example 复制一份: cp config.yaml.example config.yaml
       # 修改后只需 docker compose restart 即可生效；不挂载则使用内置默认值 + 环境变量
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml
       # 日志持久化目录（需要在 config.yaml 或环境变量中开启 logging.file_enabled）
       - ./logs:/app/logs
     environment:
@@ -34,8 +34,13 @@ services:
       # - THINKING_ENABLED=true
 
       # ── 历史消息压缩 ──
-      # - COMPRESSION_ENABLED=true
-      # - COMPRESSION_LEVEL=2
+      # - COMPRESSION_ENABLED=false
+      # - COMPRESSION_LEVEL=1
+
+      # ── 自动续写 & 历史消息限制 ──
+      # - MAX_AUTO_CONTINUE=0          # 截断后自动续写次数，0=禁用(默认)
+      # - MAX_HISTORY_MESSAGES=-1      # 历史消息条数上限，-1=不限制（建议改用 MAX_HISTORY_TOKENS）
+      # - MAX_HISTORY_TOKENS=150000     # 历史消息 token 数上限（推荐），默认 150000，参考值 130000~170000（代码自动补偿 Cursor 后端开销）
 
       # ── 日志持久化 ──
       # - LOG_FILE_ENABLED=true
@@ -47,3 +52,18 @@ services:
       # ── Vision 图片处理 ──
       # 默认使用本地 OCR（零配置），如需外部 Vision API 请在 config.yaml 中修改 vision.mode 为 'api'
       # 并配置 vision.base_url / vision.api_key / vision.model
+
+      # ── 工具透传模式（推荐 Roo Code / Cline 等非 Claude Code 客户端） ──
+      # 开启后跳过 few-shot 注入，直接嵌入工具定义，减少身份冲突
+      # - TOOLS_PASSTHROUGH=true
+
+      # ── 工具禁用模式（极致省上下文） ──
+      # 完全不注入工具定义和 few-shot，模型凭训练记忆调用工具
+      # - TOOLS_DISABLED=true
+
+      # ── 响应内容清洗 ──
+      # 开启后会将响应中 Cursor 身份引用替换为 Claude（默认关闭）
+      # - SANITIZE_RESPONSE=true
+
+      # ── 自定义拒绝检测规则 ──
+      # 仅支持 config.yaml 配置（无环境变量覆盖），详见 config.yaml.example 中的 refusal_patterns 节

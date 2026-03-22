@@ -1,5 +1,50 @@
 # Changelog
 
+## v2.7.5 (2026-03-19)
+
+### 🏗️ 常量集中管理
+
+- **新增 `constants.ts`**：将 `REFUSAL_PATTERNS`（50+ 条拒绝检测规则）、`IDENTITY_PROBE_PATTERNS`、`TOOL_CAPABILITY_PATTERNS`、`CLAUDE_IDENTITY_RESPONSE`、`CLAUDE_TOOLS_RESPONSE` 及自定义拒绝规则逻辑从 `handler.ts` 提取到独立文件
+- **提升可维护性**：贡献者修改内置规则时只需查看 `constants.ts`，无需翻阅 2000 行的 handler 业务逻辑
+- **`isRefusal()` 函数统一导出**：内置规则 + 自定义规则合并检测，所有调用点自动生效
+
+### 🔧 自定义拒绝检测规则
+
+- **`config.yaml` 新增 `refusal_patterns` 字段**：用户可添加自定义正则匹配规则，追加到内置列表之后（不替换），匹配到即触发重试逻辑
+- **无效正则容错**：无效的正则表达式自动退化为字面量匹配，不会导致服务报错
+- **缓存编译**：自定义规则只在配置变更时重新编译 RegExp，运行时零开销
+- **热重载支持**：修改后下一次请求即生效
+
+### 🔀 响应内容清洗开关
+
+- **`config.yaml` 新增 `sanitize_response` 字段**：控制 `sanitizeResponse()` 函数（将 Cursor 身份引用替换为 Claude），**默认关闭**
+- **环境变量支持**：`SANITIZE_RESPONSE=true` 可覆盖配置文件
+- **零开销设计**：关闭时函数入口直接返回原文本，无正则计算
+- **热重载支持**：修改配置后立即生效
+
+---
+
+## v2.7.4 (2026-03-18)
+
+### 🛡️ 截断安全 — 防止损坏的工具调用
+
+- **截断时跳过工具解析**：当响应被截断（`stop_reason=max_tokens`）时，不再尝试解析不完整的 `json action` 块，避免生成损坏的工具调用（如写入半截文件）
+- **纯文本回退**：截断响应中的不完整工具块被自动剥离，剩余文本作为纯文本返回，由客户端（Claude Code）原生续写
+- **默认禁用代理续写**：`maxAutoContinue` 默认值改为 `0`，让 Claude Code 原生处理续写（体验更好、进度可见），配置同步更新至 `config.yaml`、`config.yaml.example`、`docker-compose.yml`
+
+### 🧹 提示词注入防御增强
+
+- **身份声明清除**：自动剥离系统提示词中的 Claude Code / Anthropic 身份声明（`You are Claude Code`、`I'm Claude, made by Anthropic` 等），防止模型将其判定为 prompt injection 并拒绝服务
+- **流式热身窗口扩大**：混合流式模式的 `warmupChars` 从 96 增至 300 字符，确保拒绝检测完成前不释放任何文本给客户端
+
+### 📊 日志查看器增强
+
+- **提示词对比视图**：「💬 提示词」tab 重命名为「💬 提示词对比」，分区展示原始请求 vs 转换后的 Cursor 消息
+- **转换摘要面板**：顶部新增 6 格摘要（原始工具数 → Cursor 工具数 0、工具指令占用字符数、消息数变化、总上下文大小）
+- **工具去向提示**：当有工具时显示黄色提示「Cursor API 不支持原生 tools 参数，N 个工具已转换为文本指令嵌入 user #1」
+- **标题提取优化**：通用 XML 标签清除（覆盖所有注入标签）+ 清除 `Respond with the appropriate action` 引导语
+
+---
 ## v2.7.2 (2026-03-17)
 
 ### 🖥️ 日志查看器全面升级

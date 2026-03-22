@@ -1,8 +1,8 @@
-# Cursor2API v2.7.3
+# Cursor2API v2.7.6
 
 将 Cursor 文档页免费 AI 对话接口代理转换为 **Anthropic Messages API** 和 **OpenAI Chat Completions API**，支持 **Claude Code** 和 **Cursor IDE** 使用。
 
-> ⚠️ **版本说明**：当前 v2.7.3 统一 thinking 剥离逻辑、增强拒绝检测准确性、优化 Docker 部署配置。
+> ⚠️ **版本说明**：当前 v2.7.6 新增工具透传模式（passthrough）、工具禁用模式（disabled）、身份泄漏清洗增强和 `tool_choice=any` 引导优化。
 
 ## 上游来源（Original）
 
@@ -59,8 +59,8 @@
 - **工具参数自动修复** - 字段名映射 (`file_path` → `path`)、智能引号替换、模糊匹配修复
 - **多模态视觉降级处理** - 内置纯本地 CPU OCR 图片文字提取（零配置免 Key），或支持外接第三方免费视觉大模型 API 解释图片
 - **全工具支持** - 无工具白名单限制，支持所有 MCP 工具和自定义扩展
-- **多层拒绝拦截** - 50+ 正则模式匹配拒绝文本（中英文），自动重试 + 认知重构绕过
-- **三层身份保护** - 身份探针拦截 + 拒绝重试 + 响应清洗，确保输出永远呈现 Claude 身份
+- **多层拒绝拦截** - 50+ 正则模式匹配拒绝文本（中英文），自动重试 + 认知重构绕过，支持自定义规则
+- **三层身份保护** - 身份探针拦截 + 拒绝重试 + 响应清洗（可配置开关），确保输出永远呈现 Claude 身份
 - **截断无缝续写** - Proxy 底层自动拼接被截断的工具响应（最多 6 次），含智能去重
 - **渐进式历史压缩** - 智能识别消息类型，工具调用摘要化、工具结果头尾保留，不破坏 JSON 结构
 - **🆕 可配置压缩系统** - 支持开关 + 3档级别（轻度/中等/激进）+ 自定义参数，环境变量可覆盖
@@ -103,6 +103,14 @@ cp config.yaml.example config.yaml
 | `logging.file_enabled` | 日志文件持久化 | `false` |
 | `logging.dir` | 日志存储目录 | `./logs` |
 | `logging.max_days` | 日志保留天数 | `7` |
+| `logging.persist_mode` | 日志落盘模式：`summary` 问答摘要 / `compact` 精简 / `full` 完整 | `summary` |
+| `max_auto_continue` | 截断自动续写次数 (`0`=禁用，交由客户端续写) | `0` |
+| `max_history_messages` | 历史消息条数上限，超出时删除最早消息（建议改用 `max_history_tokens`） | `-1`（不限制） |
+| `max_history_tokens` | 历史消息 token 数上限（推荐），代码自动补偿 Cursor 后端开销（1,300 基础 + 工具 tokenizer 差异），参考值 `130000~170000` | `150000` |
+| `sanitize_response` | 响应内容清洗开关（替换 Cursor 身份引用为 Claude） | `false` |
+| `refusal_patterns` | 自定义拒绝检测规则列表（追加到内置规则） | 不配置 |
+| `tools.passthrough` | 🆕 透传模式：跳过 few-shot 注入，原始 JSON 嵌入（Roo Code/Cline 推荐） | `false` |
+| `tools.disabled` | 🆕 禁用模式：完全不注入工具定义，极致省上下文 | `false` |
 
 > 💡 详细配置说明请参见 `config.yaml.example` 中的注释。
 
@@ -155,6 +163,8 @@ OPENAI_BASE_URL=http://localhost:3010/v1
 - **阶段耗时** - 可视化时间线展示各阶段耗时（receive → convert → send → response → complete）
 - **🌙 日/夜主题** - 一键切换明暗主题，自动记忆偏好
 - **日志持久化** - 配置 `logging.file_enabled: true` 后日志写入 JSONL 文件，重启自动加载
+- **摘要落盘（默认）** - `logging.persist_mode: summary` 仅保留“用户问题 + 模型回答”与少量元数据，体积最小
+- **精简落盘** - `logging.persist_mode: compact` 保留更多排障字段，同时压缩磁盘 JSONL
 
 ### 鉴权
 
@@ -172,6 +182,7 @@ cursor2api/
 │   ├── index.ts            # 入口 + Express 服务 + 路由 + API 鉴权中间件
 │   ├── config.ts           # 配置管理（含 auth_tokens / vision.proxy）
 │   ├── types.ts            # 类型定义（含 thinking / authTokens）
+│   ├── constants.ts        # 全局常量（拒绝模式、身份探针、回复模板）
 │   ├── cursor-client.ts    # Cursor API 客户端 + Chrome TLS 指纹
 │   ├── converter.ts        # 协议转换 + 提示词注入 + 上下文清洗 + 动态预算
 │   ├── handler.ts          # Anthropic API 处理器 + 身份保护 + 拒绝拦截 + Thinking
@@ -255,6 +266,8 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 
 | 环境变量 | 说明 |
 |----------|------|
+> ⚠️ **环境变量优先级高于 `config.yaml`**：若在 docker-compose 等环境中设置了环境变量，该参数的 `config.yaml` 配置会被覆盖，热重载对其**无效**。需要通过 `config.yaml` 动态调整的参数，请勿同时在环境变量中设置。
+
 | `PORT` | 服务端口 |
 | `AUTH_TOKEN` | API 鉴权 token（逗号分隔多个） |
 | `PROXY` | 全局代理地址 |
@@ -264,6 +277,12 @@ AI 按此格式输出 → 我们解析并转换为标准的 Anthropic `tool_use`
 | `COMPRESSION_LEVEL` | 压缩级别 (`1`/`2`/`3`) |
 | `LOG_FILE_ENABLED` | 日志文件持久化 (`true`/`false`) |
 | `LOG_DIR` | 日志文件目录 |
+| `MAX_AUTO_CONTINUE` | 截断自动续写次数 (`0`=禁用) |
+| `MAX_HISTORY_MESSAGES` | 历史消息条数上限（`-1`=不限制） |
+| `MAX_HISTORY_TOKENS` | 历史消息 token 数上限（默认 `150000`，`-1`=不限制，参考值 `130000~170000`，代码自动补偿 Cursor 后端开销） |
+| `SANITIZE_RESPONSE` | 响应内容清洗开关 (`true`/`false`，默认 `false`) |
+| `TOOLS_PASSTHROUGH` | 🆕 工具透传模式 (`true`/`false`，默认 `false`) |
+| `TOOLS_DISABLED` | 🆕 工具禁用模式 (`true`/`false`，默认 `false`) |
 
 ## 免责声明 / Disclaimer
 
