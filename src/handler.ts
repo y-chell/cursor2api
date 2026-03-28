@@ -131,6 +131,18 @@ export function estimateInputTokens(body: AnthropicRequest): number {
         total += 350;                    // Tool use guidelines and behavior instructions
     }
 
+    // ★ 上下文压力膨胀（Context Pressure Inflation）
+    // Claude Code 假设模型的 context window 是 200K tokens，在 ~80%（160K）时触发自动压缩。
+    // 但 Cursor API 的实际 context window 只有 ~150K tokens。
+    // 这意味着 Claude Code 到 160K 才压缩，而 Cursor 在 ~120K 输入时就已开始挤压输出空间。
+    // 解决方案：虚增 input_tokens，让 Claude Code 以为上下文更满，提前触发压缩。
+    // 膨胀系数 1.35 = 200K / 150K（Cursor 实际窗口与 Claude Code 假设窗口的比值）
+    // 效果：当 Cursor 实际输入达到 ~118K 时，报告给 Claude Code 的是 ~160K，触发压缩。
+    const contextPressure = getConfig().contextPressure ?? 1.0; // 默认关闭（1.0=不膨胀），推荐 1.35
+    if (contextPressure > 1.0) {
+        total = Math.ceil(total * contextPressure);
+    }
+
     return Math.max(1, total);
 }
 
@@ -479,6 +491,50 @@ function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
     return false;
 }
 
+function getLargePayloadText(toolCall: ParsedToolCall): string {
+    for (const key of ['content', 'new_string', 'new_str', 'text', 'file_text', 'code', 'command']) {
+        const value = toolCall.arguments?.[key];
+        if (typeof value === 'string' && value.length > 0) return value;
+    }
+    return '';
+}
+
+function payloadLooksSemanticallyIncomplete(payload: string): boolean {
+    const trimmed = payload.trimEnd();
+    if (trimmed.length < 1200) return false;
+
+    const fenceCount = (trimmed.match(/^```/gm) || []).length;
+    if (fenceCount % 2 !== 0) return true;
+
+    const lastNonEmptyLine = trimmed
+        .split('\n')
+        .reverse()
+        .find(line => line.trim().length > 0)
+        ?.trim() || '';
+
+    if (!lastNonEmptyLine) return false;
+    if (lastNonEmptyLine === '|') return true;
+
+    if (lastNonEmptyLine.startsWith('|')) {
+        const pipeCount = (lastNonEmptyLine.match(/\|/g) || []).length;
+        if (pipeCount < 3) return true;
+    }
+
+    if (/^([-*+]|\d+\.)\s*$/.test(lastNonEmptyLine)) return true;
+    if (/[,;:\[{(]\s*$/.test(lastNonEmptyLine)) return true;
+
+    const likelyDanglingToken = /^[\p{L}\p{N}_./`-]{1,16}$/u.test(lastNonEmptyLine)
+        && !/[.!?;:。！？`"'”’)\]}]$/.test(lastNonEmptyLine);
+    if (likelyDanglingToken) return true;
+
+    return false;
+}
+
+function toolCallLooksSemanticallyIncomplete(toolCall: ParsedToolCall): boolean {
+    if (!toolCallNeedsMoreContinuation(toolCall)) return false;
+    return payloadLooksSemanticallyIncomplete(getLargePayloadText(toolCall));
+}
+
 /**
  * 截断不等于必须续写。
  *
@@ -491,7 +547,17 @@ function toolCallNeedsMoreContinuation(toolCall: ParsedToolCall): boolean {
  * 2. 已恢复出的工具调用明显属于大参数写入类，需要继续补全内容
  */
 export function shouldAutoContinueTruncatedToolResponse(text: string, hasTools: boolean): boolean {
-    if (!hasTools || !isTruncated(text)) return false;
+    if (!hasTools) return false;
+
+    if (!isTruncated(text)) {
+        if (!hasToolCalls(text)) return false;
+
+        const { toolCalls } = parseToolCalls(text);
+        if (toolCalls.length === 0) return false;
+
+        return toolCalls.some(toolCallLooksSemanticallyIncomplete);
+    }
+
     // ★ json action 块未闭合是最精确的截断信号，不受长度限制影响
     // isTruncated 在有 json action 块时 early return：全闭合→false，未闭合→true
     // 所以此处 isTruncated=true 且有开标签，必然意味着 action 块未闭合，无需重复计数
@@ -603,7 +669,11 @@ export async function autoContinueCursorToolResponseStream(
     hasTools: boolean,
 ): Promise<string> {
     let fullResponse = initialResponse;
-    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
+    // OpenAI-compatible clients expect complete tool calls in one logical response.
+    // Unlike Claude Code, they generally cannot recover a truncated json action block
+    // by issuing a native follow-up continuation themselves, so we force at least
+    // one internal continuation attempt here.
+    const MAX_AUTO_CONTINUE = Math.max(getConfig().maxAutoContinue, 1);
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
 
@@ -678,7 +748,9 @@ export async function autoContinueCursorToolResponseFull(
     hasTools: boolean,
 ): Promise<string> {
     let fullText = initialText;
-    const MAX_AUTO_CONTINUE = getConfig().maxAutoContinue;
+    // Keep non-stream OpenAI-compatible tool responses aligned with the stream helper:
+    // always allow at least one internal continuation for truncated tool payloads.
+    const MAX_AUTO_CONTINUE = Math.max(getConfig().maxAutoContinue, 1);
     let continueCount = 0;
     let consecutiveSmallAdds = 0;
 
@@ -1493,6 +1565,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             blockIndex++;
         }
 
+        let toolCallsDetected = 0;
         if (hasTools) {
             // ★ 截断保护：如果响应被截断，不要解析不完整的工具调用
             // 直接作为纯文本返回 max_tokens，让客户端自行处理续写
@@ -1579,6 +1652,8 @@ Please go ahead and pick the most appropriate tool for the current task and outp
                 log.warn('Handler', 'toolparse', `tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
             }
 
+
+            toolCallsDetected = toolCalls.length;
 
             if (toolCalls.length > 0) {
                 stopReason = 'tool_use';
@@ -1720,6 +1795,7 @@ Please go ahead and pick the most appropriate tool for the current task and outp
         log.updateSummary({
             inputTokens: cursorUsage?.inputTokens,
             outputTokens: cursorUsage?.outputTokens,
+            toolCallsDetected,
         });
         log.complete(fullResponse.length, stopReason);
 
@@ -1924,6 +2000,7 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
         log.warn('Handler', 'truncation', `非流式检测到截断响应 (${fullText.length} chars) → stop_reason=max_tokens`);
     }
 
+    let toolCallsDetected = 0;
     if (hasTools) {
         let { toolCalls, cleanText } = parseToolCalls(fullText);
 
@@ -1985,6 +2062,8 @@ Please go ahead and pick the most appropriate tool for the current task and outp
             log.warn('Handler', 'toolparse', `非流式 tool_choice=any 重试${TOOL_CHOICE_MAX_RETRIES}次后仍无工具调用`);
         }
 
+        toolCallsDetected = toolCalls.length;
+
         if (toolCalls.length > 0) {
             stopReason = 'tool_use';
 
@@ -2045,7 +2124,11 @@ Please go ahead and pick the most appropriate tool for the current task and outp
     const estimatedInput = estimateCursorReqTokens(activeCursorReq);
     const actualInput = cursorUsage?.inputTokens;
     console.log(`[TokenDiff] 非流式 估算(我们发的)=${estimatedInput} Cursor实际=${actualInput ?? 'N/A'} Cursor隐藏开销=${actualInput != null ? (actualInput - estimatedInput) : 'N/A'}`);
-    log.updateSummary({ inputTokens: cursorUsage?.inputTokens, outputTokens: cursorUsage?.outputTokens });
+    log.updateSummary({
+        inputTokens: cursorUsage?.inputTokens,
+        outputTokens: cursorUsage?.outputTokens,
+        toolCallsDetected,
+    });
     log.complete(fullText.length, stopReason);
 
     } catch (err: unknown) {

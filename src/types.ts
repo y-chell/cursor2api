@@ -139,6 +139,8 @@ export interface AppConfig {
         dir: string;               // 日志文件存储目录
         max_days: number;          // 日志保留天数
         persist_mode: 'compact' | 'full' | 'summary'; // 落盘模式: compact=精简, full=完整, summary=仅问答摘要
+        db_enabled: boolean;       // 是否启用 SQLite 存储
+        db_path: string;           // SQLite 文件路径，默认 './logs/cursor2api.db'
     };
     tools?: {
         schemaMode: 'compact' | 'full' | 'names_only';  // Schema 呈现模式
@@ -147,8 +149,11 @@ export interface AppConfig {
         exclude?: string[];                               // 黑名单：要排除的工具名
         passthrough?: boolean;                            // 透传模式：跳过 few-shot 注入，直接嵌入工具定义
         disabled?: boolean;                               // 禁用模式：完全不注入工具定义，最大化节省上下文
+        adaptiveBudget?: boolean;                         // 自适应历史预算：根据工具数量自动收紧历史 token 预算
+        smartTruncation?: boolean;                        // 智能截断：按工具类型差异化截断结果（Read/Bash/Search 各用不同策略）
     };
     sanitizeEnabled: boolean;    // 是否启用响应内容清洗（替换 Cursor 身份引用为 Claude），默认 false
+    contextPressure?: number;    // 上下文压力膨胀系数（默认 1.35），虚增 input_tokens 让客户端提前压缩
     refusalPatterns?: string[];  // 自定义拒绝检测规则（追加到内置列表之后）
     fingerprint: {
         userAgent: string;

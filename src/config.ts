@@ -81,6 +81,8 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
                 dir: yaml.logging.dir || './logs',
                 max_days: typeof yaml.logging.max_days === 'number' ? yaml.logging.max_days : 7,
                 persist_mode: persistModes.includes(yaml.logging.persist_mode) ? yaml.logging.persist_mode : 'summary',
+                db_enabled: yaml.logging.db_enabled === true,
+                db_path: yaml.logging.db_path || './logs/cursor2api.db',
             };
         }
         // ★ 工具处理配置
@@ -94,6 +96,8 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
                 exclude: Array.isArray(t.exclude) ? t.exclude.map(String) : undefined,
                 passthrough: t.passthrough === true,
                 disabled: t.disabled === true,
+                adaptiveBudget: t.adaptive_budget === true,    // 默认关闭
+                smartTruncation: t.smart_truncation === true,   // 默认关闭
             };
         }
         // ★ 响应内容清洗开关（默认关闭）
@@ -103,6 +107,10 @@ function parseYamlConfig(defaults: AppConfig): { config: AppConfig; raw: Record<
         // ★ 自定义拒绝检测规则
         if (Array.isArray(yaml.refusal_patterns)) {
             result.refusalPatterns = yaml.refusal_patterns.map(String).filter(Boolean);
+        }
+        // ★ 上下文压力膨胀系数
+        if (typeof yaml.context_pressure === 'number') {
+            result.contextPressure = yaml.context_pressure;
         }
     } catch (e) {
         console.warn('[Config] 读取 config.yaml 失败:', e);
@@ -143,20 +151,28 @@ function applyEnvOverrides(cfg: AppConfig): void {
     }
     // Logging 环境变量覆盖
     if (process.env.LOG_FILE_ENABLED !== undefined) {
-        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary' };
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
         cfg.logging.file_enabled = process.env.LOG_FILE_ENABLED === 'true' || process.env.LOG_FILE_ENABLED === '1';
     }
     if (process.env.LOG_DIR) {
-        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary' };
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
         cfg.logging.dir = process.env.LOG_DIR;
     }
     if (process.env.LOG_PERSIST_MODE) {
-        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary' };
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
         cfg.logging.persist_mode = process.env.LOG_PERSIST_MODE === 'full'
             ? 'full'
             : process.env.LOG_PERSIST_MODE === 'summary'
                 ? 'summary'
                 : 'compact';
+    }
+    if (process.env.LOG_DB_ENABLED !== undefined) {
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
+        cfg.logging.db_enabled = process.env.LOG_DB_ENABLED === 'true' || process.env.LOG_DB_ENABLED === '1';
+    }
+    if (process.env.LOG_DB_PATH) {
+        if (!cfg.logging) cfg.logging = { file_enabled: false, dir: './logs', max_days: 7, persist_mode: 'summary', db_enabled: false, db_path: './logs/cursor2api.db' };
+        cfg.logging.db_path = process.env.LOG_DB_PATH;
     }
     // 工具透传模式环境变量覆盖
     if (process.env.TOOLS_PASSTHROUGH !== undefined) {
@@ -168,10 +184,24 @@ function applyEnvOverrides(cfg: AppConfig): void {
         if (!cfg.tools) cfg.tools = { schemaMode: 'full', descriptionMaxLength: 0 };
         cfg.tools.disabled = process.env.TOOLS_DISABLED === 'true' || process.env.TOOLS_DISABLED === '1';
     }
+    // 自适应历史预算环境变量覆盖
+    if (process.env.TOOLS_ADAPTIVE_BUDGET !== undefined) {
+        if (!cfg.tools) cfg.tools = { schemaMode: 'full', descriptionMaxLength: 0 };
+        cfg.tools.adaptiveBudget = process.env.TOOLS_ADAPTIVE_BUDGET !== 'false' && process.env.TOOLS_ADAPTIVE_BUDGET !== '0';
+    }
+    // 智能截断环境变量覆盖
+    if (process.env.TOOLS_SMART_TRUNCATION !== undefined) {
+        if (!cfg.tools) cfg.tools = { schemaMode: 'full', descriptionMaxLength: 0 };
+        cfg.tools.smartTruncation = process.env.TOOLS_SMART_TRUNCATION !== 'false' && process.env.TOOLS_SMART_TRUNCATION !== '0';
+    }
 
     // 响应内容清洗环境变量覆盖
     if (process.env.SANITIZE_RESPONSE !== undefined) {
         cfg.sanitizeEnabled = process.env.SANITIZE_RESPONSE === 'true' || process.env.SANITIZE_RESPONSE === '1';
+    }
+    // 上下文压力膨胀系数环境变量覆盖
+    if (process.env.CONTEXT_PRESSURE !== undefined) {
+        cfg.contextPressure = parseFloat(process.env.CONTEXT_PRESSURE);
     }
 
     // 从 base64 FP 环境变量解析指纹

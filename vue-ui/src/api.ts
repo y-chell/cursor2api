@@ -30,8 +30,9 @@ export function fetchRequests(limit = 50): Promise<RequestSummary[]> {
   return apiFetch<RequestSummary[]>(`/api/requests?limit=${limit}`);
 }
 
-export function fetchStats(): Promise<Stats> {
-  return apiFetch<Stats>('/api/stats');
+export function fetchStats(since?: number): Promise<Stats> {
+  const qs = since !== undefined ? `?since=${since}` : '';
+  return apiFetch<Stats>(`/api/vue/stats${qs}`);
 }
 
 export function fetchPayload(requestId: string): Promise<Payload> {
@@ -63,6 +64,30 @@ export async function saveConfig(cfg: Partial<HotConfig>): Promise<SaveConfigRes
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<SaveConfigResult>;
+}
+
+export interface RequestsPage {
+  summaries: RequestSummary[];
+  hasMore: boolean;
+  total: number;
+  statusCounts: Record<string, number>;
+}
+
+export interface RequestsFilter {
+  limit?: number;
+  before?: number;
+  status?: string;
+  keyword?: string;
+  since?: number;
+}
+
+export function fetchMoreRequests(filter: RequestsFilter = {}): Promise<RequestsPage> {
+  const q = new URLSearchParams({ limit: String(filter.limit ?? 50) });
+  if (filter.before !== undefined) q.set('before', String(filter.before));
+  if (filter.since !== undefined) q.set('since', String(filter.since));
+  if (filter.status) q.set('status', filter.status);
+  if (filter.keyword) q.set('keyword', filter.keyword);
+  return apiFetch<RequestsPage>(`/api/requests/more?${q.toString()}`);
 }
 
 export function createSSEConnection(onMessage: (event: string, data: unknown) => void): EventSource {
